@@ -3,10 +3,13 @@
   "version": "1.0.0",
   "main": "src/index.js",
   "_comments": {
-    "start": "The start script runs the React development server. 'BROWSER=none' prevents the browser from opening automatically since it already opens."
+    "start": "The start script runs the React frontend, Node.js backend, and Flask LLM server concurrently."
   },
   "scripts": {
-    "start": "react-scripts start",
+    "start": "concurrently --names \"FRONTEND,BACKEND,LLM\" --prefix-colors \"cyan,green,magenta\" \"npm run start:frontend\" \"npm run start:backend\" \"npm run start:llm\"",
+    "start:frontend": "react-scripts start",
+    "start:backend": "node server/server.js",
+    "start:llm": "cd ../LLMAcadamic-Advisor && python3 -m api.api || (echo '❌ Python3 not found. Please install Python3 or configure pyenv.' && exit 1)",
     "build": "react-scripts build",
     "test": "react-scripts test",
     "eject": "react-scripts eject"
@@ -35,6 +38,7 @@
     ]
   },
   "devDependencies": {
+    "concurrently": "^9.2.1",
     "cross-env": "^7.0.3"
   }
 }

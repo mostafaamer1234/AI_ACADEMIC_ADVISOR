@@ -19,7 +19,8 @@ def setup_environment(whatIfUpload):
 
     # HAVE TO MODIFY THESE 2
     os.environ['LANGCHAIN_API_KEY'] = 'REDACTED'
-    os.environ['OPENAI_API_KEY'] = "sk-8qf2TFyLVqeYVSo9EACP7lRzPsZiSwkCoJnYQb87goT3BlbkFJ8suYWFNl9BIUzoI67FgNOK2weCxgUdVhY5jQt8wMMA"
+    os.environ['OPENAI_API_KEY'] = "REDACTED"
+    os.environ['OPENAI_API_BASE'] = 'https://api.openai.com/v1'
 
     #  Handle Uploaded Transcript
     transcript_file = whatIfUpload.files['transcript']

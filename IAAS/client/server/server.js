@@ -72,7 +72,7 @@ app.post('/api/login', async (req, res) => {
         const passwordMatch = await bcrypt.compare(password, user.password);
 
         if (passwordMatch) {
-            res.json({ message: 'Login successful', user: { id: user.id, name: user.name, email: user.email, role: user.role, sex: user.sex, dateOfBirth: user.dateOfBirth } }); // Send user data
+            res.json({ message: 'Login successful', token: 'dummy-token-' + user.id, user: { id: user.id, name: user.name, email: user.email, role: user.role, sex: user.sex, dateOfBirth: user.dateOfBirth } }); // Send user data
         } else {
             res.status(401).json({ error: 'Invalid credentials' });
         }

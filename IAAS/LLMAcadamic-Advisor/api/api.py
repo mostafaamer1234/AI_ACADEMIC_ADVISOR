@@ -1,4 +1,7 @@
 
+from LLM.main_copy import setup_environment
+from LLM.main_copy import aggregate_and_generate_response
+from LLM.majorsGraph import MajorGraph
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS, cross_origin
 import sys
@@ -6,11 +9,8 @@ import os
 import io
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from LLM.majorsGraph import MajorGraph
-from LLM.main_copy import aggregate_and_generate_response
-from LLM.main_copy import setup_environment
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=['http://localhost:3000', 'http://127.0.0.1:3000'])
 
 
 @app.route('/llm/generate-response', methods=['POST'])
@@ -34,12 +34,73 @@ def handle_setup_environment():
     if 'transcript' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
 
-    transcript = request
+    transcript = request.files['transcript']
+    
+    # Validate file
+    if transcript.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    if not transcript.filename.lower().endswith('.pdf'):
+        return jsonify({'error': 'Only PDF files are allowed'}), 400
+    
     try:
-        setup_environment(transcript)
+        # Save file temporarily to a more accessible location
+        import tempfile
+        import os
+        
+        # Create a temporary file with proper extension
+        temp_dir = tempfile.gettempdir()
+        temp_filename = f"transcript_{os.urandom(8).hex()}.pdf"
+        temp_path = os.path.join(temp_dir, temp_filename)
+        
+        # Save the uploaded file
+        transcript.save(temp_path)
+        
+        # Verify the file was saved and is readable
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+            return jsonify({'error': 'Failed to save uploaded file'}), 500
+        
+        # Create a mock request object with the saved file
+        class MockFile:
+            def __init__(self, path, original_filename):
+                self.path = path
+                self.filename = original_filename
+            
+            def save(self, destination):
+                import shutil
+                shutil.copy2(self.path, destination)
+        
+        # Create mock request object
+        class MockRequest:
+            def __init__(self, file_path, filename):
+                self.files = {'transcript': MockFile(file_path, filename)}
+        
+        mock_request = MockRequest(temp_path, transcript.filename)
+        
+        # Call setup_environment
+        setup_environment(mock_request)
+        
+        # Clean up temporary file
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+            
         return jsonify({"message": "Environment setup successfully"}), 200
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Clean up temporary file on error
+        try:
+            if 'temp_path' in locals() and os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except:
+            pass
+            
+        import traceback
+        error_details = str(e)
+        print(f"Setup environment error: {error_details}")
+        print(f"Traceback: {traceback.format_exc()}")
+        return jsonify({"error": f"Setup failed: {error_details}"}), 500
 
 
 @app.route('/llm/generate-major-graph', methods=['POST'])
@@ -71,4 +132,4 @@ def generate_major_graph():
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=5002)
