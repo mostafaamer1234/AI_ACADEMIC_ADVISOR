@@ -1,14 +1,19 @@
 
-from LLM.main_copy import setup_environment
-from LLM.main_copy import aggregate_and_generate_response
-from LLM.majorsGraph import MajorGraph
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS, cross_origin
 import sys
 import os
 import io
 
+# Add the parent directory to Python path BEFORE importing LLM modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# Now import LLM modules
+from LLM.main_copy import setup_environment
+from LLM.main_copy import aggregate_and_generate_response
+from LLM.majorsGraph import MajorGraph
+
+# Import Flask modules
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS, cross_origin
 app = Flask(__name__)
 CORS(app, origins=['http://localhost:3000', 'http://127.0.0.1:3000'])
 
