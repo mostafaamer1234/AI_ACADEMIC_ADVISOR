@@ -1,146 +1,227 @@
-# Academic Advisor AI System
+# 🎓 AI Academic Advisor System (IAAS)
 
-This project implements an AI-powered academic advisor system that helps students understand their academic progress, generate graduation plans, and explore course prerequisites. The system uses advanced language models and graph-based course analysis to provide personalized academic guidance.
+An intelligent academic advising system that helps students understand their academic progress, generate personalized graduation plans, and explore course prerequisites using advanced AI and machine learning.
 
-## Project Structure
+## 🌟 Features
+
+- **🔐 User Authentication**: Secure login system for students, faculty, and administrators
+- **📄 PDF Transcript Processing**: Upload and analyze academic transcripts using AI
+- **🎯 Graduation Planning**: Generate personalized semester-by-semester graduation plans
+- **🤖 AI Chat Advisor**: Interactive chatbot for academic guidance
+- **📊 Course Prerequisites**: Visual graph-based course prerequisite analysis
+- **👥 Multi-Role Support**: Student, Faculty, and Admin dashboards
+
+## 🚀 Quick Start
+
+### Prerequisites
+- Node.js (v16+)
+- Python 3.8+
+- MySQL/XAMPP
+- Git
+
+### Python Dependencies
+Install Python dependencies using one of these methods:
+
+**Option 1: Automated Installation**
+```bash
+./install_python_deps.sh
+```
+
+**Option 2: Manual Installation**
+```bash
+pip3 install -r requirements.txt
+```
+
+### Installation & Setup
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/mostafaamer1234/AI_ACADEMIC_ADVISOR.git
+   cd AI_ACADEMIC_ADVISOR/IAAS/client
+   ```
+
+2. **Run the setup script:**
+   ```bash
+   ./setup.sh
+   ```
+
+3. **Start the application:**
+   ```bash
+   npm start
+   ```
+
+That's it! The application will start all three servers automatically:
+- 🔵 **Frontend**: http://localhost:3000
+- 🟢 **Backend**: http://localhost:5001
+- 🟣 **LLM Server**: http://localhost:5002
+
+## 📖 Documentation
+
+- **[Quick Start Guide](QUICK_START.md)** - One-page setup guide
+- **[Startup Guide](IAAS/client/STARTUP.md)** - Detailed setup instructions
+- **[Troubleshooting](IAAS/client/TROUBLESHOOTING.md)** - Complete troubleshooting guide
+
+## 🏗️ Architecture
+
+### Frontend (React)
+- **Location**: `IAAS/client/`
+- **Port**: 3000
+- **Features**: User interface, file upload, chat interface
+
+### Backend (Node.js + Express)
+- **Location**: `IAAS/client/server/`
+- **Port**: 5001
+- **Features**: Authentication, database management, user management
+
+### LLM Server (Flask + Python)
+- **Location**: `IAAS/LLMAcadamic-Advisor/api/`
+- **Port**: 5002
+- **Features**: PDF processing, AI graduation planning, course analysis
+
+### Database
+- **Type**: MySQL
+- **Database**: `Advising`
+- **Tables**: `users`, course data, academic records
+
+## 🛠️ Technology Stack
+
+### Frontend
+- React 18
+- Axios for API calls
+- Material-UI components
+- React Router for navigation
+
+### Backend
+- Node.js + Express
+- MySQL with connection pooling
+- bcrypt for password hashing
+- CORS enabled
+
+### AI/ML
+- Python Flask API
+- LangChain for document processing
+- OpenAI GPT-4 for AI responses
+- ChromaDB for vector storage
+- PyPDF for PDF processing
+
+## 📁 Project Structure
 
 ```
-IAAS/
-├── LLMAcadamic-Advisor/
-│   ├── LLM/                    # Core LLM implementation
-│   │   ├── main_copy.py        # Main LLM processing logic
-│   │   ├── majorsGraph.py      # Course graph implementation
-│   │   └── all_abington_majors_combined(5).csv  # Course data
-│   └── api/
-│       └── api.py              # REST API implementation
-└── chroma_courses/             # Vector store for course embeddings
+AI_ACADEMIC_ADVISOR/
+├── IAAS/
+│   ├── client/                 # React frontend
+│   │   ├── src/
+│   │   │   ├── components/     # React components
+│   │   │   ├── pages/         # Page components
+│   │   │   ├── services/      # API services
+│   │   │   └── styles/        # CSS styles
+│   │   ├── server/            # Node.js backend
+│   │   ├── setup.sh           # Setup script
+│   │   ├── STARTUP.md         # Startup guide
+│   │   └── TROUBLESHOOTING.md # Troubleshooting guide
+│   └── LLMAcadamic-Advisor/   # AI/ML backend
+│       ├── api/               # Flask API
+│       ├── LLM/               # AI processing modules
+│       └── requirements.txt   # Python dependencies
+├── chroma_courses/            # Vector database
+├── requirements.txt           # Main Python dependencies
+├── install_python_deps.sh     # Python setup script
+├── QUICK_START.md            # Quick start guide
+└── README.md                 # This file
 ```
 
-## Features
+## 🔧 Configuration
 
-### 1. Academic Progress Analysis
-- Analyzes student transcripts and What-If reports
-- Identifies completed and in-progress courses
-- Calculates remaining requirements
-- Provides detailed academic progress summaries
+### Environment Variables
+The application uses the following environment variables (configured in the code):
 
-### 2. Graduation Planning
-- Generates personalized semester-by-semester graduation plans
-- Considers course prerequisites and availability
-- Ensures balanced course loads (max 15 credits per semester)
-- Accounts for completed and in-progress courses
+- `LANGCHAIN_API_KEY`: LangChain API key
+- `OPENAI_API_KEY`: OpenAI API key
+- `LANGCHAIN_ENDPOINT`: LangChain endpoint URL
 
-### 3. Course Prerequisites Analysis
-- Visualizes course prerequisite relationships
-- Provides detailed prerequisite information for any course
-- Helps students plan their course sequence effectively
+### Database Setup
+1. Start MySQL/XAMPP
+2. Create database named `Advising`
+3. Import user tables and course data
 
-### 4. Major Requirements Analysis
-- Analyzes specific major requirements
-- Tracks progress towards degree completion
-- Identifies missing requirements and courses
+## 🚨 Troubleshooting
 
-## Backend Architecture
+### Common Issues
 
-### 1. Language Model Integration
-- Uses OpenAI's GPT-4 model for natural language processing
-- Implements LangChain for document processing and retrieval
-- Employs vector embeddings for semantic search
+1. **Login fails**: Check if backend server is running on port 5001
+2. **PDF upload fails**: Check if LLM server is running on port 5002
+3. **CORS errors**: Restart all servers with `npm start`
+4. **Python not found**: Use `python3` (already configured)
 
-### 2. Document Processing
-- PDF processing for student transcripts
-- Text extraction and analysis
-- Information redaction for privacy
+### Complete Reset
+```bash
+# Stop all servers
+lsof -ti:3000,5001,5002 | xargs kill 2>/dev/null
 
-### 3. Vector Store
-- Uses ChromaDB for efficient document storage and retrieval
-- Implements semantic search for course matching
-- Maintains course metadata and descriptions
+# Restart everything
+cd IAAS/client
+npm start
+```
 
-### 4. Course Graph Implementation
-- Represents courses and their prerequisites as a directed graph
-- Enables efficient prerequisite chain analysis
-- Supports visualization of course relationships
+For detailed troubleshooting, see [TROUBLESHOOTING.md](IAAS/client/TROUBLESHOOTING.md)
 
-### 5. REST API
-- Flask-based RESTful API implementation
-- CORS-enabled for cross-origin requests
-- Key endpoints:
-  - `/llm/generate-response`: Generates graduation plans and answers academic questions
-  - `/llm/setup-environment`: Processes student transcripts
-  - `/llm/generate-major-graph`: Creates visual course prerequisite graphs
-
-## Setup and Installation
-
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. Set up environment variables:
-   ```bash
-   export OPENAI_API_KEY="your_openai_api_key"
-   export LANGCHAIN_API_KEY="your_langchain_api_key"
-   export LANGCHAIN_ENDPOINT="https://api.smith.langchain.com"
-   ```
-
-4. Start the API server:
-   ```bash
-   python IAAS/LLMAcadamic-Advisor/api/api.py
-   ```
-
-## Usage
-
-1. Upload student transcript:
-   ```bash
-   POST /llm/setup-environment
-   Content-Type: multipart/form-data
-   ```
-
-2. Generate graduation plan:
-   ```bash
-   POST /llm/generate-response
-   Content-Type: application/json
-   {
-     "user_question": "Generate my graduation plan"
-   }
-   ```
-
-3. View course prerequisites:
-   ```bash
-   POST /llm/generate-major-graph
-   Content-Type: application/json
-   {
-     "major_name": "Computer Science"
-   }
-   ```
-
-## Security Features
-
-- Student information redaction from transcripts
-- Secure API key management
-- Input validation and error handling
-- CORS protection
-
-## Dependencies
-
-- Flask
-- LangChain
-- OpenAI
-- ChromaDB
-- Pandas
-- NetworkX (for graph visualization)
-- PyPDF2 (for PDF processing)
-
-## Contributing
+## 🤝 Contributing
 
 1. Fork the repository
 2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
 
-## License
+## 📄 License
 
-This project is licensed under the MIT License - see the LICENSE file for details. 
+This project is private and proprietary. All rights reserved.
+
+## 👨‍💻 Author
+
+**Mostafa Amer**
+- GitHub: [@mostafaamer1234](https://github.com/mostafaamer1234)
+- Repository: https://github.com/mostafaamer1234/AI_ACADEMIC_ADVISOR
+
+## 🎯 Features in Detail
+
+### User Authentication
+- Secure login system with bcrypt password hashing
+- Role-based access (Student, Faculty, Admin)
+- Session management with JWT tokens
+
+### PDF Processing
+- Upload academic transcripts in PDF format
+- AI-powered document analysis and extraction
+- Student information redaction for privacy
+
+### Graduation Planning
+- AI-generated personalized graduation plans
+- Semester-by-semester course recommendations
+- Prerequisite checking and validation
+- Credit hour calculations
+
+### AI Chat Advisor
+- Interactive chatbot for academic questions
+- Context-aware responses based on student data
+- Course recommendation and planning assistance
+
+## 🔒 Security Features
+
+- Password hashing with bcrypt
+- CORS protection
+- Input validation and sanitization
+- Secure file upload handling
+- Error handling without information leakage
+
+## 📊 Performance
+
+- Concurrent server management
+- Efficient database queries
+- Vector database for fast AI processing
+- Optimized React components
+- Background processing for heavy tasks
+
+---
+
+**🎉 Ready to use!** The application is production-ready and includes comprehensive documentation, automated setup, and troubleshooting guides.
