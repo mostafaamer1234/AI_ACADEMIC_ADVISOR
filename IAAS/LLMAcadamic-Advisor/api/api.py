@@ -118,8 +118,7 @@ def generate_major_graph():
             return jsonify({"error": "Major name is required"}), 400
 
         # Initialize MajorGraph with the CSV file path
-        csv_path = os.path.join(os.path.dirname(
-            __file__), '..', 'LLM', '/Users/mostafa/newFianlLLMRepo/IAAS/LLMAcadamic-Advisor/LLM/all_abington_majors_combined(5).csv')
+        csv_path = os.path.join(os.path.dirname(__file__), '..', 'LLM', 'all_abington_majors_combined(5).csv')
         mg = MajorGraph(csv_path)
 
         # Generate the graph and get the image buffer

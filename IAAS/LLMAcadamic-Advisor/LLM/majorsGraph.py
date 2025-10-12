@@ -343,12 +343,12 @@ class MajorGraph:
 
 
 mg = MajorGraph(
-    "/Users/mostafa/newFianlLLMRepo/IAAS/LLMAcadamic-Advisor/LLM/all_abington_majors_combined(5).csv")
+    os.path.join(os.path.dirname(__file__), "all_abington_majors_combined(5).csv"))
 
 if __name__ == "__main__":
     # Create instance of MajorGraph
     mg = MajorGraph(
-        "/Users/mostafa/newFianlLLMRepo/IAAS/LLMAcadamic-Advisor/LLM/all_abington_majors_combined(5).csv")
+        os.path.join(os.path.dirname(__file__), "all_abington_majors_combined(5).csv"))
     # Print and draw the hierarchy for a specific major
     mg.print_hierarchy("Computer Science, B.S. (Abington)")
     mg.draw_major_graph("Computer Science, B.S. (Abington)")

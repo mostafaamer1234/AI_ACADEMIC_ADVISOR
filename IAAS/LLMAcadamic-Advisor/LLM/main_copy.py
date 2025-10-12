@@ -31,7 +31,7 @@ def setup_environment(whatIfUpload):
     temp_pdf_path = f"/tmp/{filename}"  # Save to a temporary directory
     transcript_file.save(temp_pdf_path)
 
-    courses_csv_path = "/Users/mostafa/newFianlLLMRepo/IAAS/LLMAcadamic-Advisor/LLM/all_abington_majors_combined(5).csv"
+    courses_csv_path = os.path.join(os.path.dirname(__file__), "all_abington_majors_combined(5).csv")
 
     #  LLM Instances
     llm1 = ChatOpenAI(model_name="gpt-4o", temperature=0)

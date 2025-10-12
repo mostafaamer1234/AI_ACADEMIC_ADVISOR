@@ -42,8 +42,8 @@ def setup_environment(whatIfUpload):
         pdf_splits, embedding=OpenAIEmbeddings())
     pdf_retriever = vectorstore_pdf.as_retriever(search_kwargs={"k": 3})
 
-    #  Process CSV & Save to Vectorstore
-    courses_csv_path = "/Users/mostafa/newFianlLLMRepo/IAAS/LLMAcadamic-Advisor/LLM/processed_psu_courses.csv"
+    #  Process CSV & Save to Vectorstore - Use relative path
+    courses_csv_path = os.path.join(os.path.dirname(__file__), "processed_psu_courses.csv")
     df = pd.read_csv(courses_csv_path)
     courses_texts = []
     courses_metadata = []

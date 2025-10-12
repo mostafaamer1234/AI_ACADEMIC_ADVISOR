@@ -181,8 +181,9 @@ def visualize_graph(G):
     plt.axis("off")
     plt.show()
 
-# Example usage
-csv_file_path = "/Users/mostafa/newFianlLLMRepo/IAAS/LLMAcadamic-Advisor/LLM/processed_psu_courses.csv"
+# Example usage - Use relative path that works on any system
+import os
+csv_file_path = os.path.join(os.path.dirname(__file__), "processed_psu_courses.csv")
 course_graph = build_course_graph(csv_file_path)
 
 
