@@ -1,21 +1,22 @@
-import json
-import os
-import re
-import sys
-
-import pandas as pd
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import Chroma
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from werkzeug.utils import secure_filename
-
-# Add current directory to Python path BEFORE importing local modules
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.messages import SystemMessage, HumanMessage
+import pandas as pd
+import sys
+import re
+import os
+import json
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-# Now import local modules
 from graphExperiment import course_graph, get_course_prerequisites, get_major_course_codes
+
+
+# Add current directory to Python path BEFORE importing local modules
+
+# Now import local modules
 
 
 def setup_environment(whatIfUpload):
