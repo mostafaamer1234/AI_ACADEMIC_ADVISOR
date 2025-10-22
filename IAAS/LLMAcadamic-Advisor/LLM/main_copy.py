@@ -1,4 +1,3 @@
-from graphExperiment import course_graph, get_course_prerequisites, get_major_course_codes
 import json
 import os
 import re
@@ -16,6 +15,7 @@ from werkzeug.utils import secure_filename
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 # Now import local modules
+from graphExperiment import course_graph, get_course_prerequisites, get_major_course_codes
 
 
 def setup_environment(whatIfUpload):
