@@ -4,7 +4,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain.schema import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 import pandas as pd
 from werkzeug.utils import secure_filename  # Import for handling file names
 
@@ -43,7 +43,8 @@ def setup_environment(whatIfUpload):
     pdf_retriever = vectorstore_pdf.as_retriever(search_kwargs={"k": 3})
 
     #  Process CSV & Save to Vectorstore - Use relative path
-    courses_csv_path = os.path.join(os.path.dirname(__file__), "processed_psu_courses.csv")
+    courses_csv_path = os.path.join(os.path.dirname(
+        __file__), "processed_psu_courses.csv")
     df = pd.read_csv(courses_csv_path)
     courses_texts = []
     courses_metadata = []
