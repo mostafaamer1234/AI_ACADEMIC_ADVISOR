@@ -2,6 +2,14 @@
 import sys
 import os
 import io
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Add the parent directory to Python path BEFORE importing LLM modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -103,8 +111,13 @@ def handle_setup_environment():
             
         import traceback
         error_details = str(e)
-        print(f"Setup environment error: {error_details}")
-        print(f"Traceback: {traceback.format_exc()}")
+        traceback_str = traceback.format_exc()
+        logger.error(f"Setup environment error: {error_details}")
+        logger.error(f"Traceback: {traceback_str}")
+        # Also print to stderr so systemd can capture it
+        import sys
+        print(f"Setup environment error: {error_details}", file=sys.stderr)
+        print(f"Traceback: {traceback_str}", file=sys.stderr)
         return jsonify({"error": f"Setup failed: {error_details}"}), 500
 
 
