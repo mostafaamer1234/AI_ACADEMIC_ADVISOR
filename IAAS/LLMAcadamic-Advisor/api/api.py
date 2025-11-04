@@ -15,7 +15,7 @@ from LLM.majorsGraph import MajorGraph
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS, cross_origin
 app = Flask(__name__)
-CORS(app, origins=['http://localhost:3000', 'http://127.0.0.1:3000'])
+CORS(app, origins=['http://localhost:3000', 'http://127.0.0.1:3000', 'http://13.58.145.194', '*'])
 
 
 @app.route('/llm/generate-response', methods=['POST'])
