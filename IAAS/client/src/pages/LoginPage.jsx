@@ -13,7 +13,7 @@ const LoginPage = ({ onLogin }) => {
         setError('');
 
         try {
-            const response = await axios.post('http://localhost:5001/api/login', { email, password });
+            const response = await axios.post('/api/login', { email, password });
             const user = response.data.user;
             onLogin(user);
             localStorage.setItem('token', response.data.token);

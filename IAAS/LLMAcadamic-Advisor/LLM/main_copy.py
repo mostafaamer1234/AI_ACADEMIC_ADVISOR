@@ -140,7 +140,7 @@ def extract_not_satisfied_sections(docs):
 def process_whatif_report(user_question):
     # Step 1: Get requirement info
     requirement_docs = pdf_retriever.invoke(
-        "All unmet requirements and Not Satisfied sections in the What-If Report")
+        "All unmet requirements and Not Satisfied sections in the What-If Report( Academic requirements report). ")
     filtered_requirements = "\n\n".join(
         doc.page_content for doc in requirement_docs if "Not Satisfied" in doc.page_content
     )
@@ -260,17 +260,17 @@ def aggregate_and_generate_response(user_question):
 
     instruction_prompt = SystemMessage(
         content=(
-            "You are an academic advisor assistant AI.\n\n"
+            "You are an academic advisor AI assistant.\n\n"
             "TASK 1: If the user asks about general education codes (e.g., GH, GS, CMPAB_BS), explain what the student has completed and still needs, using the context from their student record.\n\n"
             "TASK 2: If the user asks about a graduation plan, do the following:\n"
             f"1. Use the student's academic record ({student_record}) to find what courses/credits they've already satisfied, what courses or units or credits they still need to satisfy, and their major/option.\n"
             f"2. After retrieving all the student's records and major information from ({student_record}), Use the major requirements document({major_requirement}) to find the student's major,and all required courses for the student's (major and/or option) to graduate including general education requirements. Then\n"
             f"3. Subtract courses/units already completed and satisfied or in-progress (IP)(retrieved from {student_record}), from the required courses/units still needed for the major (retrieved from the major requirements {major_requirement}) And put them in a list, that list is the courses the student still needs to graduate.\n"
-            "4. Divide remaining courses (from the list) over available semesters (8 total max minus semesters the student already completed, will equal semesters the student have left, or you can just equally divide the courses into semesters with max of 15 credits per semester).\n"
-            f"5. Structure the graduation plan like a bulletin semesters each semester includes the courses the student hasn't taken yet but needs to. ONLY OUTPUT COURSES NOT TAKEN YET, EXCLUDE COURSES TAKEN AND/OR IN-PROGRESS(IP)\n"
-            f"6. Output a detailed accurate semester-by-semester graduation plan of class's/courses still needed to satisfy unsatisfied unit requirements, find the exact number that matches each course name and the full pre-requisites from ({full_graph_text}, Example output for each course in the graduation plan, STRICTLY FOLLOW THAT FORMAT: EX:(CMPSC 441: AI, prerequisites: CMPSC 462). Get the values and prerequisites from {full_graph_text}) .\n"
-            f"7. Use the prerequisite graph ({full_graph_text}), to make sure that the pre-requisites for each course in the plan are the CORRECT pre-requisites.\n"
-            f"8. Give a summary of all the student's info at the end, and give some notes/advice. Mention missing information if any. \n\n"
+           # f"4. Use the prerequisite graph ({full_graph_text}), to make sure courses are only recommended when prerequisites are met.\n"
+            f"4. Divide remaining courses (from the list) over available semesters (8 total max minus semesters the student already completed will equal semesters the student have left) you can equally divide the courses into semesters with max of 15 credits per semester and minimum of 12 credits per semester!\n"
+            f"5. Structure the graduation plan like a bulletin semesters each semester includes the courses the student hasn't taken yet but needs to. ONLY OUTPUT COURSES NOT TAKEN YET, EXCLUDE COURSES TAKEN AND/OR SATISFIED\n"
+            f"6. Output a detailed accurate semester-by-semester graduation plan of class's/courses still needed to satisfy unsatisfied unit requirements for graduation, In-Progress (IP) Classes DOES NOT satisfy missing or unsatisfied credit requirements still needed! find the exact number that matches each course name, and the prerequisites from ({full_graph_text}, Example output for each course in the graduation plan, STRICTLY FOLLOW THAT FORMAT FOR ALL THE COURSES YOU RECOMMEND : (CMPSC441: AI, prerequisites: CMPSC462). Get the values of prerequisites from {full_graph_text}) .\n"
+            f"7. Give a summary of all the student's info at the end, and give some notes/advice. Mention missing information if any \n\n"
             f"TASK 3: If the user asks about prerequisites for a course, answer using the prerequisite graph ({full_graph_text})."
         )
     )

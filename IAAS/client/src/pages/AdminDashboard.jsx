@@ -27,7 +27,7 @@ const AdminDashboard = ({ onRegister }) => {
 
 
         try {
-            const response = await axios.post('http://localhost:5001/api/register', { name, email, password, role, sex, dateOfBirth });
+            const response = await axios.post('/api/register', { name, email, password, role, sex, dateOfBirth });
 
             setSuccess(response.data.message);
             localStorage.setItem('token', response.data.token);

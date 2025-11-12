@@ -33,7 +33,7 @@ const CoursePlanner = ({ setDisableButton }) => {
     const generateGraduationPlan = async () => {
         setLoading(true);
         try {
-            const response = await axios.post('http://127.0.0.1:5002/llm/generate-response', {
+            const response = await axios.post('/llm/generate-response', {
                 user_question: 'Generate a Graduation Plan based on my major from what-if report',
             });
 

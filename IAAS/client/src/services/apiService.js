@@ -1,8 +1,8 @@
-const API_URL = 'http://localhost:5002/llm'; // Flask backend URL
+const API_URL = '/llm'; // Flask backend URL (relative URL for Nginx proxy)
 
 export const generateResponse = async (userQuestion) => {
     try {
-        const response = await fetch("http://127.0.0.1:5002/llm/generate-response", {
+        const response = await fetch("/llm/generate-response", {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -25,7 +25,7 @@ export const generateResponse = async (userQuestion) => {
 
 export const setupEnvironment = async (formData) => {
     try {
-        const response = await fetch(`http://127.0.0.1:5002/llm/setup-environment`, {
+        const response = await fetch(`/llm/setup-environment`, {
             method: 'POST',
             body: formData, // Send the FormData object
         });
