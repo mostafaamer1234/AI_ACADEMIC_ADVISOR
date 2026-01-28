@@ -69,7 +69,19 @@ app.post('/api/login', async (req, res) => {
         }
 
         const user = results[0];
-        const passwordMatch = await bcrypt.compare(password, user.password);
+        
+        // Try bcrypt first (server uses bcrypt)
+        let passwordMatch = await bcrypt.compare(password, user.password);
+        
+        // If bcrypt fails, try bcryptjs (create_user.js uses bcryptjs)
+        if (!passwordMatch) {
+            try {
+                const bcryptjs = require('bcryptjs');
+                passwordMatch = await bcryptjs.compare(password, user.password);
+            } catch (e) {
+                // bcryptjs not available, continue with bcrypt result
+            }
+        }
 
         if (passwordMatch) {
             res.json({ message: 'Login successful', token: 'dummy-token-' + user.id, user: { id: user.id, name: user.name, email: user.email, role: user.role, sex: user.sex, dateOfBirth: user.dateOfBirth } }); // Send user data

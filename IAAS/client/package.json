@@ -9,7 +9,8 @@
     "start": "concurrently --names \"FRONTEND,BACKEND,LLM\" --prefix-colors \"cyan,green,magenta\" \"npm run start:frontend\" \"npm run start:backend\" \"npm run start:llm\"",
     "start:frontend": "react-scripts start",
     "start:backend": "node server/server.js",
-    "start:llm": "cd ../LLMAcadamic-Advisor && python3 start_flask.py || (echo '❌ Python3 not found. Please install Python3 or configure pyenv.' && exit 1)",
+    "start:llm": "cd ../LLMAcadamic-Advisor && python3 start_flask.py || (echo '❌ Failed to start Flask server. Make sure Python3 is installed and dependencies are installed.' && exit 1)",
+    "kill:servers": "pkill -f 'python.*start_flask' 2>/dev/null || true; pkill -f 'node.*server.js' 2>/dev/null || true",
     "build": "react-scripts build",
     "test": "react-scripts test",
     "eject": "react-scripts eject"

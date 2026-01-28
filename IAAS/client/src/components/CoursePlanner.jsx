@@ -9,6 +9,15 @@ const CoursePlanner = ({ setDisableButton }) => {
     const [generateEnabled, setGenerateEnable] = useState(false);
     const [showInitializing, setShowInitializing] = useState(false);
 
+    const getUserId = () => {
+        try {
+            const user = JSON.parse(localStorage.getItem('user') || '{}');
+            return user.id || user.email || 'default';
+        } catch {
+            return 'default';
+        }
+    };
+
     const handleFileUpload = (e) => {
         const file = e.target.files[0];
         initializeEnvironment(file);
@@ -20,7 +29,7 @@ const CoursePlanner = ({ setDisableButton }) => {
             const formData = new FormData();
             formData.append('transcript', file); 
     
-            const message = await setupEnvironment(formData); 
+            const message = await setupEnvironment(formData, getUserId()); 
             console.log('Environment initialized:', message);
             setGenerateEnable(true);
             setShowInitializing(false)
@@ -35,6 +44,7 @@ const CoursePlanner = ({ setDisableButton }) => {
         try {
             const response = await axios.post('/llm/generate-response', {
                 user_question: 'Generate a Graduation Plan based on my major from what-if report',
+                user_id: getUserId(),
             });
 
             setGraduationPlan(response.data.graduation_plan || 'No plan generated.');

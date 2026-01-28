@@ -1,59 +1,26 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-import Dashboard from './pages/Dashboard'; // Student Dashboard
-import FacultyDashboard from './pages/FacultyDashboard'; // Faculty Dashboard
+import Dashboard from './pages/Dashboard'; // AI Advisor page (student dashboard)
+import FacultyDashboard from './pages/FacultyDashboard'; // Faculty Advisor page
 import AdminDashboard from './pages/AdminDashboard'; // Admin Dashboard
 import Profile from './pages/Profile'; // Profile page
-import LoginPage from './pages/LoginPage'; // Login page
-import Navbar from './components/Navbar'; // Shared Navbar
 
 const AppRouter = () => {
-  const [user, setUser] = useState(null); // State to track logged-in user
-
-  const handleLogin = (credentials) => {
-    setUser(credentials); // Set the user after login
-  };
-
-  const handleLogout = () => {
-    setUser(null); // Clear the user on logout
-  };
-
   return (
     <Router>
-      {/* Render Navbar only if the user is logged in */}
-      {user && <Navbar user={user} onLogout={handleLogout} />}
       <Routes>
-        {/* Login Route */}
-        <Route
-          path="/"
-          element={
-            user ? (
-              user.role === 'student' ? (
-                <Dashboard />
-              ) : user.role === 'faculty' ? (
-                <FacultyDashboard />
-              ) : user.role === 'admin' ? (
-                <AdminDashboard />
-              ) : (
-                <Navigate to="/login" />
-              )
-            ) : (
-              <LoginPage onLogin={handleLogin} />
-            )
-          }
-        />
+        {/* AI Advisor Route (default) */}
+        <Route path="/" element={<Dashboard />} />
+        <Route path="/dashboard" element={<Dashboard />} />
+
+        {/* Faculty Advisor Route */}
+        <Route path="/faculty-dashboard" element={<FacultyDashboard />} />
+
+        {/* Admin Dashboard Route */}
+        <Route path="/admin-dashboard" element={<AdminDashboard />} />
 
         {/* Profile Route */}
-        <Route
-          path="/profile"
-          element={
-            user ? (
-              <Profile />
-            ) : (
-              <Navigate to="/" />
-            )
-          }
-        />
+        <Route path="/profile" element={<Profile />} />
 
         {/* Catch-All Route */}
         <Route path="*" element={<Navigate to="/" />} />

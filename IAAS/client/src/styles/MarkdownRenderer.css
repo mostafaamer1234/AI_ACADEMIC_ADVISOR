@@ -1,0 +1,114 @@
+.markdown-content {
+    line-height: 1.8;
+    color: #333;
+    font-size: 1em;
+}
+
+.simple-section {
+    margin-bottom: 1.5em;
+}
+
+.simple-header {
+    font-size: 1.25em;
+    font-weight: 600;
+    color: #333;
+    margin: 1.2em 0 0.8em 0;
+    padding: 0.5em 0;
+    border-bottom: 2px solid #e0e0e0;
+}
+
+.simple-paragraph {
+    margin: 0.6em 0;
+    line-height: 1.8;
+    color: #444;
+}
+
+.simple-list-item {
+    margin: 0.5em 0;
+    padding: 0.4em 0;
+    line-height: 1.7;
+    color: #444;
+    border-left: 3px solid transparent;
+    padding-left: 0.8em;
+}
+
+.simple-list-item:hover {
+    border-left-color: #ddd;
+}
+
+.list-content {
+    color: #444;
+    display: block;
+}
+
+.course-listing {
+    display: block;
+    margin: 0.6em 0;
+    padding: 0.8em;
+    background-color: #f8f9fa;
+    border-left: 3px solid #ddd;
+    border-radius: 4px;
+    line-height: 1.7;
+}
+
+.course-code {
+    font-family: 'Courier New', monospace;
+    font-weight: 600;
+    color: #333;
+    background-color: #f0f0f0;
+    padding: 2px 6px;
+    border-radius: 3px;
+    margin-right: 0.4em;
+    font-size: 0.95em;
+    display: inline-block;
+}
+
+.course-code-inline {
+    font-family: 'Courier New', monospace;
+    font-weight: 600;
+    color: #333;
+    background-color: #f0f0f0;
+    padding: 2px 5px;
+    border-radius: 3px;
+    margin: 0 2px;
+    font-size: 0.9em;
+}
+
+.course-name {
+    font-weight: 500;
+    color: #333;
+    font-family: inherit;
+    margin-left: 0.3em;
+}
+
+.course-details {
+    font-size: 0.9em;
+    color: #666;
+    font-family: inherit;
+    margin-left: 0.5em;
+    font-style: italic;
+}
+
+/* Ensure proper line breaks */
+.markdown-content {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+/* Better spacing between elements */
+.simple-paragraph + .simple-header {
+    margin-top: 1.5em;
+}
+
+.simple-list-item + .simple-list-item {
+    margin-top: 0.4em;
+}
+
+/* Clean up any remaining markdown artifacts */
+.markdown-content :deep(code),
+.markdown-content :deep(pre) {
+    background: transparent;
+    padding: 0;
+    font-family: inherit;
+}
+

@@ -136,20 +136,47 @@ def get_course_prerequisites(course_code, G):
     concurrents = [u for u, v, d in G.in_edges(course_code, data=True) if d.get("type") == "concurrent"]
 
     df = pd.read_csv(csv_file_path)
-    logic_line = df[df["course_number"].str.upper().str.strip() == course_code.upper()]["prerequisite_data"].values
-    _, _, concurrent_logic, prereq_logic = extract_prereq_and_concurrent(logic_line[0] if len(logic_line) else "")
+    row = df[df["course_number"].str.upper().str.strip() == course_code.upper()]
+
+    enforced_prereqs = []
+    concurrent_options = []
+
+    if not row.empty:
+        raw_prereq_data = str(row.iloc[0].get("prerequisite_data", "") or "")
+        raw_course_numbers = str(row.iloc[0].get("prerequisite_course_numbers", "") or "")
+        try:
+            # prerequisite_data typically holds enforced prereqs
+            enforced_prereqs = list({c.strip() for c in eval(raw_prereq_data)}) if raw_prereq_data else []
+        except Exception:
+            enforced_prereqs = prereqs
+        try:
+            all_listed = list({c.strip() for c in eval(raw_course_numbers)}) if raw_course_numbers else []
+        except Exception:
+            all_listed = []
+
+        # Anything listed but not in enforced_prereqs becomes concurrent/“at enrollment” options
+        concurrent_options = [c for c in all_listed if c not in enforced_prereqs]
+
+        # Fallback to graph edges if lists are empty
+        if not enforced_prereqs and prereqs:
+            enforced_prereqs = prereqs
+        if not concurrent_options and concurrents:
+            concurrent_options = concurrents
+    else:
+        enforced_prereqs = prereqs
+        concurrent_options = concurrents
 
     result = f"Prerequisites for {course_code}:\n"
-    if prereq_logic:
-        result += f"- Required before: {', or '.join(prereq_logic)}\n"
-    elif prereqs:
-        result += f"- Required before: {', '.join(prereqs)}\n"
-    if concurrent_logic:
-        result += f"- Can be taken concurrently: {', or '.join(concurrent_logic)}\n"
-    elif concurrents:
-        result += f"- Can be taken concurrently: {', '.join(concurrents)}\n"
-    if not prereqs and not concurrents:
-        result += "- No prerequisites listed."
+    if enforced_prereqs:
+        result += f"- Enforced prerequisite at enrollment: {', '.join(sorted(enforced_prereqs))}\n"
+    else:
+        result += "- Enforced prerequisite at enrollment: None\n"
+
+    if concurrent_options:
+        result += f"- Enforced concurrent at enrollment (can be taken together): {', '.join(sorted(concurrent_options))}\n"
+    else:
+        result += "- Enforced concurrent at enrollment: None\n"
+
     return result
 
 # Visualize the course graph clearly

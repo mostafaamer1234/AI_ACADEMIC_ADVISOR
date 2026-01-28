@@ -21,7 +21,7 @@ const FacultyDashboard = () => {
     try {
       setLoading(true);
       const response = await fetch(
-        "/llm/generate-major-graph",
+        "http://127.0.0.1:5002/llm/generate-major-graph",
         {
           method: "POST",
           headers: {
@@ -37,11 +37,13 @@ const FacultyDashboard = () => {
         setGraphImage(imageUrl);
         setMessage("Graph generated successfully!");
       } else {
-        setMessage("Failed to generate graph. Please try again.");
+        const errorData = await response.json().catch(() => ({ error: "Unknown error" }));
+        console.error("Graph generation failed:", errorData);
+        setMessage(`Failed to generate graph: ${errorData.error || "Please try again."}`);
       }
     } catch (error) {
       console.error("Error generating graph:", error);
-      setMessage("An error occurred while generating the graph.");
+      setMessage(`An error occurred while generating the graph: ${error.message}`);
     } finally {
       setLoading(false);
     }
