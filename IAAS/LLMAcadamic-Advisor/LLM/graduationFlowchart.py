@@ -37,6 +37,18 @@ def _normalize_course_code(code: str) -> str:
     return re.sub(r"\s+", " ", code.strip().upper())
 
 
+def _parse_credits(value, default: int = 0) -> int:
+    """
+    Parse credit values that may be ranges like "82–85" or "90-110".
+    Uses the max numeric value found; falls back to default if none.
+    """
+    if value is None:
+        return default
+    text = str(value)
+    nums = [int(n) for n in re.findall(r"\d+", text)]
+    return max(nums) if nums else default
+
+
 def load_prereq_map(courses_csv_path: str) -> Dict[str, List[str]]:
     df = pd.read_csv(courses_csv_path)
     prereq_map: Dict[str, List[str]] = {}
@@ -416,7 +428,7 @@ class GraduationFlowchart:
             dominant_dept = self._dominant_dept(prescribed_courses) or "OPT"
 
         # ---- Option-specific (recommend specific courses, limited by needed credits) ----
-        credits_for_major = int(row.get("Credits for Major", 0) or 0)
+        credits_for_major = _parse_credits(row.get("Credits for Major", 0), default=0)
         approx_fixed_credits = 3 * len(fixed_courses)
         remaining_major_credits = max(0, credits_for_major - approx_fixed_credits)
 
@@ -757,7 +769,7 @@ def generate_semester_plan(
         dominant_dept = flowchart._dominant_dept(prescribed_courses) or "OPT"
 
     # Option course selection based on remaining major credits
-    credits_for_major = int(row.get("Credits for Major", 0) or 0)
+    credits_for_major = _parse_credits(row.get("Credits for Major", 0), default=0)
     major_course_set = {
         _normalize_course_code(c)
         for c in (fixed_courses + option_course_list)

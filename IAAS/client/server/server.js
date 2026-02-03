@@ -1,6 +1,7 @@
 const express = require('express');
 const mysql = require('mysql');
 const bcrypt = require('bcrypt');
+const { exec } = require('child_process');
 const saltRounds = 10;
 const cors = require('cors');
 
@@ -8,21 +9,89 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-const connection = mysql.createConnection({
-    host: '127.0.0.1',
-    user: 'root',
-    database: 'Advising'
-});
+const dbConfig = {
+    host: process.env.MYSQL_HOST || '127.0.0.1',
+    user: process.env.MYSQL_USER || 'root',
+    password: process.env.MYSQL_PASSWORD || '',
+    database: process.env.MYSQL_DATABASE || 'Advising',
+    port: process.env.MYSQL_PORT ? Number(process.env.MYSQL_PORT) : 3306
+};
 
-connection.connect((err) => {
-    if (err) {
-        console.error('Error connecting to database: ', err);
-        return;
+const disableDb = String(process.env.MYSQL_DISABLE || '').toLowerCase() === 'true';
+const autoStartEnabled = String(process.env.MYSQL_AUTO_START || '').toLowerCase() !== 'false';
+const isMac = process.platform === 'darwin';
+let autoStartAttempted = false;
+let connection = null;
+let dbAvailable = false;
+
+if (disableDb) {
+    console.warn('⚠️ MYSQL_DISABLE=true → running without database. Auth endpoints will return 503.');
+} else {
+    const tryAutoStartMysql = (onDone) => {
+        if (!isMac || !autoStartEnabled || autoStartAttempted) {
+            return onDone(false);
+        }
+        autoStartAttempted = true;
+        console.warn('⚠️ MySQL not running. Attempting to start via Homebrew...');
+        exec('brew services start mysql', (err, stdout, stderr) => {
+            if (err) {
+                console.warn('⚠️ Failed to start MySQL via Homebrew.');
+                if (stderr) {
+                    console.warn(stderr.trim());
+                }
+                return onDone(false);
+            }
+            if (stdout) {
+                console.log(stdout.trim());
+            }
+            setTimeout(() => onDone(true), 1500);
+        });
+    };
+
+    const connectDb = () => {
+        connection = mysql.createConnection(dbConfig);
+
+        connection.connect((err) => {
+            if (err) {
+                dbAvailable = false;
+                const isConnRefused = err.code === 'ECONNREFUSED';
+                if (isConnRefused) {
+                    return tryAutoStartMysql((started) => {
+                        if (started) {
+                            return connectDb();
+                        }
+                        console.warn('⚠️ Database unavailable. Start MySQL or set MYSQL_DISABLE=true.');
+                        console.warn(`   ${err.code || 'MYSQL_ERROR'} ${err.address || ''}:${err.port || ''}`);
+                    });
+                }
+                console.warn('⚠️ Database unavailable. Start MySQL or set MYSQL_DISABLE=true.');
+                console.warn(`   ${err.code || 'MYSQL_ERROR'} ${err.address || ''}:${err.port || ''}`);
+                return;
+            }
+            dbAvailable = true;
+            console.log('Connected to database');
+        });
+
+        connection.on('error', (err) => {
+            dbAvailable = false;
+            console.error('Database connection error:', err);
+        });
+    };
+
+    connectDb();
+}
+
+const ensureDbAvailable = (req, res, next) => {
+    if (disableDb) {
+        return res.status(503).json({ error: 'Database disabled. Set MYSQL_DISABLE=false to enable.' });
     }
-    console.log('Connected to database');
-});
+    if (!dbAvailable || !connection) {
+        return res.status(503).json({ error: 'Database unavailable. Start MySQL and retry.' });
+    }
+    return next();
+};
 
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', ensureDbAvailable, async (req, res) => {
     const { name, email, password, role, sex, dateOfBirth } = req.body;
     console.log("Role from client:", role);
 
@@ -53,7 +122,7 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', ensureDbAvailable, async (req, res) => {
     const { email, password } = req.body;
 
     const query = 'SELECT * FROM users WHERE email = ?';

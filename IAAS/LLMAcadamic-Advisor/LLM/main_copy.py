@@ -314,7 +314,7 @@ def setup_environment(whatIfUpload=None, user_id='default'):
             except Exception as e:
                 print(f"⚠️ Failed to cache student data on upload: {e}")
             pdf_splits = chunk_with_metadata(pdf_docs)
-            
+
             # Use cached embeddings
             cached_embeddings = CachedEmbeddings(OpenAIEmbeddings())
             vectorstore_pdf = Chroma.from_documents(
@@ -323,10 +323,10 @@ def setup_environment(whatIfUpload=None, user_id='default'):
                 persist_directory=os.path.join(CHROMA_DATA_DIR, "transcripts"),
                 embedding=cached_embeddings
             )
-            
+
             # Track collection creation for TTL cleanup
             track_collection_creation(collection_name, user_id)
-            
+
             pdf_retriever = vectorstore_pdf.as_retriever(
                 search_type="mmr",
                 search_kwargs={"k": 10, "fetch_k": 40, "lambda_mult": 0.5}
@@ -353,7 +353,7 @@ def setup_environment(whatIfUpload=None, user_id='default'):
         df_courses = pd.read_csv(courses_csv_path)
         course_texts = []
         course_metadata = []
-        
+
         for _, row in df_courses.iterrows():
             course_text = f"Course: {row.get('course_number', '')}. "
             course_text += f"Title: {row.get('course_name', '')}. "
@@ -415,7 +415,7 @@ def setup_environment(whatIfUpload=None, user_id='default'):
                 persist_directory=chroma_courses_dir
             )
             vectorstore_courses.persist()
-        
+
         course_retriever = vectorstore_courses.as_retriever(search_kwargs={"k": 5})
         print("✅ Course-level vectorstore initialized.")
     else:
@@ -1226,7 +1226,7 @@ def aggregate_and_generate_response(user_question=None):
     
     courses_csv = os.path.join(os.path.dirname(__file__), "processed_psu_courses.csv")
     majors_csv = os.path.join(os.path.dirname(__file__), "all_abington_majors_combined(5).csv")
-    
+
     # Ensure CSV paths exist
     if not os.path.exists(courses_csv):
         alt_courses = os.path.join(os.path.dirname(__file__), "..", "LLM", "processed_psu_courses.csv")
@@ -1912,8 +1912,8 @@ Be conversational, helpful, and empathetic. Use the conversation history to main
                         course_context += "\n\nRelevant Major Requirements:\n" + "\n\n".join(
                             doc.page_content[:500] for doc in major_docs[:2]
                         )
-                if policy_context:
-                    course_context += policy_context
+            if policy_context:
+                course_context += policy_context
         except Exception as e:
             print(f"⚠️ Could not retrieve course information: {e}")
         
@@ -2051,25 +2051,30 @@ def generate_plan_from_major_and_year(major, year_level, target_grad_in_years=4)
         # Try fuzzy match on major name as a fallback
         try:
             dfm = pd.read_csv(majors_csv)
-            from fuzzywuzzy import process
-            best_match = process.extractOne(major_norm, dfm['Major Name'].tolist())
-            if best_match and best_match[1] >= 60:
-                print(f"🔄 Retrying with fuzzy matched major: {best_match[0]}")
-                plan_structure = generate_semester_plan(
-                    major_name=best_match[0],
-                    completed_courses=[],
-                    unmet_requirements=[],
-                    courses_csv_path=courses_csv,
-                    majors_csv_path=majors_csv,
-                    credits_needed=total_credits_needed
-                )
-            else:
-                return "I couldn't generate a plan without your transcript right now. Please upload your transcript or try again."
-        except Exception as e2:
-            # Fallback to stdlib fuzzy matching if fuzzywuzzy is unavailable
             try:
+                from fuzzywuzzy import process
+                best_match = process.extractOne(major_norm, dfm['Major Name'].tolist())
+                if best_match and best_match[1] >= 60:
+                    print(f"🔄 Retrying with fuzzy matched major: {best_match[0]}")
+                    plan_structure = generate_semester_plan(
+                        major_name=best_match[0],
+                        completed_courses=[],
+                        unmet_requirements=[],
+                        courses_csv_path=courses_csv,
+                        majors_csv_path=majors_csv,
+                        credits_needed=total_credits_needed
+                    )
+                else:
+                    return "I couldn't generate a plan without your transcript right now. Please upload your transcript or try again."
+            except Exception:
+                # Fallback to stdlib fuzzy matching if fuzzywuzzy is unavailable
                 import difflib
-                candidates = difflib.get_close_matches(major_norm, dfm['Major Name'].tolist(), n=1, cutoff=0.6)
+                candidates = difflib.get_close_matches(
+                    major_norm,
+                    dfm['Major Name'].tolist(),
+                    n=1,
+                    cutoff=0.6
+                )
                 if candidates:
                     print(f"🔄 Retrying with difflib matched major: {candidates[0]}")
                     plan_structure = generate_semester_plan(
@@ -2082,9 +2087,9 @@ def generate_plan_from_major_and_year(major, year_level, target_grad_in_years=4)
                     )
                 else:
                     return "I couldn't generate a plan without your transcript right now. Please upload your transcript or try again."
-            except Exception as e3:
-                print(f"⚠️ Fuzzy fallback failed: {e3}")
-                return "I couldn't generate a plan without your transcript right now. Please upload your transcript or try again."
+        except Exception as e2:
+            print(f"⚠️ Fuzzy fallback failed: {e2}")
+            return "I couldn't generate a plan without your transcript right now. Please upload your transcript or try again."
 
     # Deterministic formatting (avoid LLM hallucinations)
     start_semester_number = semesters_completed + 1 if semesters_completed > 0 else 1
