@@ -1,8 +1,20 @@
-const API_URL = 'http://localhost:5002/llm'; // Flask backend URL
+export const getLlmBaseUrl = () => {
+    const envUrl = process.env.REACT_APP_LLM_URL;
+    if (envUrl) {
+        return envUrl.replace(/\/+$/, "");
+    }
+    if (typeof window !== "undefined") {
+        const host = window.location.hostname;
+        if (host === "localhost" || host === "127.0.0.1") {
+            return "http://127.0.0.1:5002/llm";
+        }
+    }
+    return "/llm";
+};
 
 export const generateResponse = async (userQuestion, conversationHistory = [], userId = 'default') => {
     try {
-        const response = await fetch("http://127.0.0.1:5002/llm/generate-response", {
+        const response = await fetch(`${getLlmBaseUrl()}/generate-response`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -32,7 +44,7 @@ export const generateResponse = async (userQuestion, conversationHistory = [], u
 
 export const clearConversation = async (userId = 'default') => {
     try {
-        const response = await fetch("http://127.0.0.1:5002/llm/clear-conversation", {
+        const response = await fetch(`${getLlmBaseUrl()}/clear-conversation`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -56,7 +68,7 @@ export const setupEnvironment = async (formData, userId = 'default') => {
         // Append user_id to formData
         formData.append('user_id', userId);
         
-        const response = await fetch(`http://127.0.0.1:5002/llm/setup-environment`, {
+        const response = await fetch(`${getLlmBaseUrl()}/setup-environment`, {
             method: 'POST',
             body: formData, // Send the FormData object
         });

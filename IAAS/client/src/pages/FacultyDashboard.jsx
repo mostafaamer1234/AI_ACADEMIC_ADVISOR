@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import Navbar from "../components/Navbar";
+import { getLlmBaseUrl } from "../services/apiService";
 import "../styles/Dashboard.css";
 
 const FacultyDashboard = () => {
@@ -21,7 +22,7 @@ const FacultyDashboard = () => {
     try {
       setLoading(true);
       const response = await fetch(
-        "http://127.0.0.1:5002/llm/generate-major-graph",
+        `${getLlmBaseUrl()}/generate-major-graph`,
         {
           method: "POST",
           headers: {
