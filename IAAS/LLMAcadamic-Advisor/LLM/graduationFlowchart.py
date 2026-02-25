@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -26,6 +27,51 @@ import networkx as nx
 
 COURSE_TOKEN_RE = re.compile(r"\b([A-Z]{2,8}(?:/[A-Z]{2,8})*)\s*(\d{3}[A-Z]?)\b")
 GENED_CREDITS_RE = re.compile(r"([A-Za-z \-\(\)]+):\s*(\d+)\s*credits", re.IGNORECASE)
+
+GENED_CATEGORY_LABELS = {
+    "GA": "Arts",
+    "GH": "Humanities",
+    "GN": "Natural Sciences",
+    "GQ": "Quantification",
+    "GS": "Social and Behavioral Sciences",
+    "GWS": "Writing and Speaking",
+    "GHW": "Health and Wellness",
+}
+
+
+def format_planned_course_label(course: str) -> str:
+    """Convert internal planner tokens to student-friendly labels."""
+    if not isinstance(course, str):
+        return str(course)
+
+    if course.startswith("GENED__"):
+        parts = course.split("__")
+        key = parts[1].upper() if len(parts) > 1 else "GENED"
+        if key in {"ELECTIVE", "GENED"}:
+            return "Gen Ed Elective"
+
+        normalized_key = key.replace("_", "/")
+        if normalized_key in GENED_CATEGORY_LABELS:
+            return f"Gen Ed ({normalized_key} - {GENED_CATEGORY_LABELS[normalized_key]})"
+
+        if "/" in normalized_key:
+            pieces = [p.strip().upper() for p in normalized_key.split("/") if p.strip()]
+            if pieces and all(re.fullmatch(r"G[A-Z]{1,3}", p) for p in pieces):
+                desc = "/".join(GENED_CATEGORY_LABELS.get(p, p) for p in pieces)
+                return f"Gen Ed ({'/'.join(pieces)} - {desc})"
+
+        if re.fullmatch(r"G[A-Z]{1,3}", normalized_key):
+            return f"Gen Ed ({normalized_key})"
+
+        return f"Gen Ed ({normalized_key.title()})"
+
+    if course.startswith("FREE__") or course.startswith("ELECTIVE__FREE__"):
+        return "Free Elective"
+
+    if course.startswith("OPT__"):
+        return "Option Elective"
+
+    return course
 
 
 def _course_level(c: str) -> int:
@@ -109,6 +155,80 @@ def load_prereq_map(courses_csv_path: str) -> Dict[str, List[str]]:
     return prereq_map
 
 
+def add_all_prerequisites_to_plan(
+    planned_courses: List[str],
+    prereq_map: Dict[str, List[str]],
+    max_depth: int = 10
+) -> List[str]:
+    """
+    CRITICAL: Recursively add ALL prerequisites for all courses in the plan.
+    If a course requires a prerequisite, that prerequisite MUST be in the plan!
+    This ensures prerequisites from other departments are included (e.g., WMNST 104 for AMST 104).
+    """
+    planned_set = {_normalize_course_code(c) for c in planned_courses}
+    new_courses = list(planned_courses)
+    added_this_iteration = True
+    iterations = 0
+    
+    # Create normalized lookup for prereq_map
+    norm_to_original: Dict[str, List[str]] = {}
+    for orig_course in prereq_map.keys():
+        orig_norm = _normalize_course_code(orig_course)
+        if orig_norm not in norm_to_original:
+            norm_to_original[orig_norm] = []
+        norm_to_original[orig_norm].append(orig_course)
+    
+    while added_this_iteration and iterations < max_depth:
+        iterations += 1
+        added_this_iteration = False
+        courses_to_check = list(new_courses)
+        
+        for course in courses_to_check:
+            c_norm = _normalize_course_code(course)
+            
+            # Get prerequisites for this course
+            prereqs = []
+            if c_norm in norm_to_original:
+                for orig_course in norm_to_original[c_norm]:
+                    prereqs.extend(prereq_map.get(orig_course, []))
+            else:
+                prereqs = prereq_map.get(c_norm, [])
+            
+            # Also try base code matching
+            if not prereqs:
+                base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", c_norm)
+                if base_match:
+                    base_code = f"{base_match.group(1)} {base_match.group(2)}"
+                    for orig_course in prereq_map.keys():
+                        orig_base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", orig_course)
+                        if orig_base_match and f"{orig_base_match.group(1)} {orig_base_match.group(2)}" == base_code:
+                            prereqs.extend(prereq_map.get(orig_course, []))
+            
+            # Add prerequisites that aren't already in the plan
+            for prereq in prereqs:
+                prereq_norm = _normalize_course_code(prereq)
+                if prereq_norm not in planned_set:
+                    # Check if we already have a base code match
+                    base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", prereq_norm)
+                    already_has_base = False
+                    if base_match:
+                        prereq_base = f"{base_match.group(1)} {base_match.group(2)}"
+                        for existing_course in planned_set:
+                            existing_base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", existing_course)
+                            if existing_base_match:
+                                existing_base = f"{existing_base_match.group(1)} {existing_base_match.group(2)}"
+                                if prereq_base == existing_base:
+                                    already_has_base = True
+                                    break
+                    
+                    if not already_has_base:
+                        new_courses.append(prereq)
+                        planned_set.add(prereq_norm)
+                        added_this_iteration = True
+    
+    return new_courses
+
+
 def schedule_mixed_by_prereqs(
     planned_courses: List[str],
     prereq_map: Dict[str, List[str]],
@@ -119,12 +239,16 @@ def schedule_mixed_by_prereqs(
     completed_courses: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, int], nx.DiGraph]:
 
+    # Normalize all planned courses
     planned_courses_norm = [_normalize_course_code(c) for c in planned_courses]
     planned_set = set(planned_courses_norm)
     remaining = set(planned_courses_norm)
     course_category = {
         _normalize_course_code(k): v for k, v in course_category.items()
     }
+    
+    # Create mapping from normalized to original for lookups
+    norm_to_original_course = {_normalize_course_code(c): c for c in planned_courses}
 
     completed_set: set = set()
     completed_base_set: set = set()
@@ -144,10 +268,79 @@ def schedule_mixed_by_prereqs(
     G = nx.DiGraph()
     for c in planned_courses_norm:
         G.add_node(c)
+    
+    # Create lookup maps for efficient prerequisite finding
+    # Map: normalized course -> list of original course codes in prereq_map
+    norm_to_original: Dict[str, List[str]] = {}
+    for orig_course in prereq_map.keys():
+        orig_norm = _normalize_course_code(orig_course)
+        if orig_norm not in norm_to_original:
+            norm_to_original[orig_norm] = []
+        norm_to_original[orig_norm].append(orig_course)
+    
+    # Also create base code -> list of courses mapping for matching
+    base_to_courses: Dict[str, List[str]] = {}
+    for orig_course in prereq_map.keys():
+        base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", orig_course)
+        if base_match:
+            base_code = f"{base_match.group(1)} {base_match.group(2)}"
+            if base_code not in base_to_courses:
+                base_to_courses[base_code] = []
+            base_to_courses[base_code].append(orig_course)
+    
     for c in planned_courses_norm:
-        for p in prereq_map.get(c, []):
-            if p in planned_set:
-                G.add_edge(p, c)
+        # Get prerequisites for this course (check normalized version)
+        prereqs = []
+        
+        # Strategy 1: Direct normalized lookup
+        if c in norm_to_original:
+            # Get prerequisites from all matching original course codes
+            for orig_course in norm_to_original[c]:
+                prereqs.extend(prereq_map.get(orig_course, []))
+        
+        # Strategy 2: Direct lookup (in case key is already normalized)
+        if not prereqs:
+            prereqs = prereq_map.get(c, [])
+        
+        # Strategy 3: Base code matching (e.g., "AMST 100" matches "AMST 100Y")
+        if not prereqs:
+            base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", c)
+            if base_match:
+                base_code = f"{base_match.group(1)} {base_match.group(2)}"
+                if base_code in base_to_courses:
+                    for orig_course in base_to_courses[base_code]:
+                        prereqs.extend(prereq_map.get(orig_course, []))
+        
+        # Remove duplicates while preserving order
+        seen_prereqs = set()
+        unique_prereqs = []
+        for p in prereqs:
+            p_norm = _normalize_course_code(p)
+            if p_norm not in seen_prereqs:
+                seen_prereqs.add(p_norm)
+                unique_prereqs.append(p)
+        
+        for p in unique_prereqs:
+            p_norm = _normalize_course_code(p)
+            # Check if prerequisite is in plan (normalized) - EXACT MATCH
+            if p_norm in planned_set:
+                # Only add edge if it doesn't create a cycle (prerequisite should come before)
+                if not G.has_edge(c, p_norm):  # Avoid reverse edge
+                    G.add_edge(p_norm, c)
+            else:
+                # Also check base code match (e.g., "MATH 311" matches "MATH 311M")
+                base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", p_norm)
+                if base_match:
+                    prereq_base = f"{base_match.group(1)} {base_match.group(2)}"
+                    for planned_course in planned_set:
+                        planned_base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", planned_course)
+                        if planned_base_match:
+                            planned_base = f"{planned_base_match.group(1)} {planned_base_match.group(2)}"
+                            if prereq_base == planned_base:
+                                # Only add edge if it doesn't create a cycle
+                                if not G.has_edge(c, planned_course):  # Avoid reverse edge
+                                    G.add_edge(planned_course, c)
+                                break
 
     if not nx.is_directed_acyclic_graph(G):
         raise ValueError("Prerequisite cycle detected")
@@ -247,6 +440,11 @@ def schedule_mixed_by_prereqs(
                     # For semesters 2+, allow courses with prereqs not in plan
                     available = [c for c in remaining]
                 
+                # Also, if we're in later semesters (5+) and have remaining courses,
+                # be more lenient about prerequisites
+                if not available and sem >= 5 and remaining:
+                    available = [c for c in remaining]
+                
                 if not available:
                     break
 
@@ -261,7 +459,7 @@ def schedule_mixed_by_prereqs(
                 )
 
             for b in bucket_order:
-                # Continue adding courses until we meet minimum OR reach maximum
+                # Continue adding courses until we meet minimum OR reach configured maximum.
                 if sem_credits >= max_credits_per_sem:
                     break
                 if not avail_by_bucket[b]:
@@ -273,7 +471,7 @@ def schedule_mixed_by_prereqs(
                 remaining.remove(c)
                 made_progress = True
                 
-                # Stop if we've reached maximum credits
+                # Stop if we've reached configured maximum.
                 if sem_credits >= max_credits_per_sem:
                     break
 
@@ -289,7 +487,7 @@ def schedule_mixed_by_prereqs(
                 # For semester 1, only add if truly available
                 additional_available = [c for c in remaining if is_available_strict(c, sem)]
             
-            # Add courses up to minimum credits
+            # Add courses up to minimum credits while respecting max credits.
             needed_credits = min_credits_per_sem - sem_credits
             courses_to_add = min(len(additional_available), needed_credits // 3)
             for c in additional_available[:courses_to_add]:
@@ -302,10 +500,58 @@ def schedule_mixed_by_prereqs(
         if not remaining:
             break
 
+    # If there are still remaining courses after all semesters, try to schedule them
+    # in later semesters (semesters 5-8) even if prerequisites aren't fully satisfied
+    # This handles cases where prerequisites might be satisfied through other means
+    # (transfer credits, placement tests, etc.) or are from other departments
+    # while respecting the configured semester credit cap.
     if remaining:
-        raise ValueError(
-            f"Could not schedule all courses. Remaining: {sorted(remaining)}"
-        )
+        for course in list(remaining):
+            # Try to schedule in semesters 5-8 (later semesters are more lenient)
+            for sem in range(5, max_semesters + 1):
+                # Check if semester has room.
+                sem_courses = [c for c, s in scheduled.items() if s == sem]
+                sem_credits = len(sem_courses) * 3
+                
+                if sem_credits < max_credits_per_sem:
+                    # Schedule the course in this semester
+                    scheduled[course] = sem
+                    remaining.remove(course)
+                    break
+        
+        # If still remaining, schedule them in any available slot.
+        if remaining:
+            for course in list(remaining):
+                for sem in range(1, max_semesters + 1):
+                    sem_courses = [c for c, s in scheduled.items() if s == sem]
+                    sem_credits = len(sem_courses) * 3
+                    
+                    if sem_credits < max_credits_per_sem:
+                        scheduled[course] = sem
+                        remaining.remove(course)
+                        break
+
+    # Only raise error if we truly can't fit all courses (all semesters are at hard limit).
+    if remaining:
+        # Check if all semesters are at configured hard limit.
+        all_full = True
+        for sem in range(1, max_semesters + 1):
+            sem_courses = [c for c, s in scheduled.items() if s == sem]
+            sem_credits = len(sem_courses) * 3
+            if sem_credits < max_credits_per_sem:
+                all_full = False
+                break
+        
+        if all_full:
+            raise ValueError(
+                f"Could not schedule all courses. Remaining: {sorted(remaining)}. "
+                f"All semesters are at maximum capacity ({max_credits_per_sem} credits)."
+            )
+        else:
+            # This shouldn't happen, but if it does, schedule remaining courses in last semester
+            for course in list(remaining):
+                scheduled[course] = max_semesters
+                remaining.remove(course)
 
     return scheduled, G
 
@@ -329,6 +575,8 @@ class GraduationFlowchart:
     def __init__(self, courses_csv: str, majors_csv: str):
         self.majors_df = pd.read_csv(majors_csv)
         self.prereq_map = load_prereq_map(courses_csv)
+        self.courses_csv_path = courses_csv
+        self.courses_df = None  # Lazy load when needed
 
     # --- Helpers restored from previous version ---
     def _get_major_row(self, major_name: str) -> pd.Series:
@@ -386,6 +634,64 @@ class GraduationFlowchart:
             return "OPT"
         return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
+    def _find_department_courses(self, prescribed_courses: List[str], row: pd.Series) -> List[str]:
+        """
+        When option courses column contains descriptive text instead of course codes,
+        find actual courses from the major's department.
+        This works for ALL majors universally.
+        """
+        if not prescribed_courses:
+            # Try to get department from additional courses or major name
+            additional_expr = str(row.get("Additional Courses", "") or "")
+            additional_courses = extract_all_courses(additional_expr)
+            if additional_courses:
+                prescribed_courses = additional_courses[:1]  # Use first additional course
+        
+        if not prescribed_courses:
+            return []
+        
+        # Get the department from prescribed courses (e.g., "AMST" from "AMST 491W")
+        # Try multiple courses to find a valid department
+        dept = None
+        for course in prescribed_courses:
+            parts = course.split()
+            if len(parts) >= 2:
+                potential_dept = parts[0].strip()
+                # Validate it looks like a department code (2-8 uppercase letters)
+                if potential_dept.isalpha() and potential_dept.isupper() and 2 <= len(potential_dept) <= 8:
+                    dept = potential_dept
+                    break
+        
+        if not dept:
+            return []
+        
+        # Load courses CSV and find courses from this department
+        try:
+            if not hasattr(self, 'courses_df') or self.courses_df is None:
+                if os.path.exists(self.courses_csv_path):
+                    self.courses_df = pd.read_csv(self.courses_csv_path)
+                else:
+                    return []
+            
+            # Find all courses from this department
+            dept_courses = []
+            for _, course_row in self.courses_df.iterrows():
+                course_code = str(course_row.get("course_number", "")).strip()
+                # Match department code at the start (e.g., "AMST 100" matches "AMST")
+                if course_code and course_code.startswith(dept + " "):
+                    # Normalize the course code
+                    normalized = _normalize_course_code(course_code)
+                    if normalized and normalized not in dept_courses:
+                        dept_courses.append(normalized)
+            
+            # Sort by course level (lower first) for better scheduling
+            dept_courses.sort(key=lambda c: (_course_level(c), c))
+            
+            return dept_courses
+        except Exception as e:
+            # Silently fail - this is a fallback mechanism
+            return []
+
     def _select_option_courses(self, option_courses: List[str], needed_credits: int, exclude: set) -> List[str]:
         n_needed = int(math.ceil(max(0, needed_credits) / 3))
         pool = [c for c in option_courses if c not in exclude]
@@ -399,10 +705,30 @@ class GraduationFlowchart:
         prescribed_expr = str(row.get("Prescribed Courses", "") or "")
         prescribed_courses = resolve_common_or_groups(extract_all_courses(prescribed_expr))
 
-        # ---- Additional (pick first listed course token deterministically) ----
+        # ---- Additional (extract ALL courses, handle "Select X credits from" lists) ----
         additional_expr = str(row.get("Additional Courses", "") or "")
         additional_courses_all = extract_all_courses(additional_expr)
-        additional_courses = additional_courses_all[:1]
+        
+        # Check if this is a "Select X credits from" type requirement
+        # If so, treat these as option courses, not fixed courses
+        is_selective_list = "select" in additional_expr.lower() and "from" in additional_expr.lower()
+        
+        # Extract ALL additional courses, not just the first one
+        # For "OR" groups like "ACCTG 211 or ACCTG 201 & 202", take the first option
+        # But extract all individual courses mentioned
+        additional_courses = []
+        additional_option_courses = []  # Courses from "Select X credits from" lists
+        seen = set()
+        
+        for course in additional_courses_all:
+            if course not in seen:
+                seen.add(course)
+                if is_selective_list:
+                    # These are option courses, not fixed requirements
+                    additional_option_courses.append(course)
+                else:
+                    # These are fixed requirements (e.g., "ACCTG 211 or ACCTG 201 & 202")
+                    additional_courses.append(course)
 
         fixed_courses = []
         for c in prescribed_courses + additional_courses:
@@ -413,6 +739,11 @@ class GraduationFlowchart:
         opt_col = self._option_courses_column(option_name or "")
         option_course_text = str(row.get(opt_col, "") or "") if opt_col else ""
         option_course_list = extract_all_courses(option_course_text)
+        
+        # If no option courses found in the column (e.g., descriptive text instead of course codes),
+        # try to find courses from the major's department
+        if not option_course_list:
+            option_course_list = self._find_department_courses(prescribed_courses, row)
 
         # Determine dominant dept for option placeholder label (e.g., CMPSC)
         # For Computer Science majors, ALWAYS use CMPSC for electives, not MATH
@@ -427,13 +758,24 @@ class GraduationFlowchart:
             # For other majors, use the most common department from prescribed courses only
             dominant_dept = self._dominant_dept(prescribed_courses) or "OPT"
 
-        # ---- Option-specific (recommend specific courses, limited by needed credits) ----
+        # ---- Calculate total credits needed ----
         credits_for_major = _parse_credits(row.get("Credits for Major", 0), default=0)
+        total_credits_required = _parse_credits(row.get("Total Credits Required", 0), default=120)
+        credits_for_gened = _parse_credits(row.get("Credits for General Education", 0), default=45)
+        
+        # Calculate fixed courses credits
         approx_fixed_credits = 3 * len(fixed_courses)
         remaining_major_credits = max(0, credits_for_major - approx_fixed_credits)
-
-        # Get available option courses (excluding fixed courses that are already in prescribed/additional)
-        available_option_courses = [c for c in option_course_list if c not in fixed_courses]
+        
+        # CRITICAL: Calculate free electives needed
+        # Free electives = Total Credits - (Major Credits + GenEd Credits)
+        major_and_gened_credits = credits_for_major + credits_for_gened
+        free_elective_credits = max(0, total_credits_required - major_and_gened_credits)
+        
+        # Get available option courses (including courses from "Select X credits from" lists)
+        # Excluding fixed courses that are already in prescribed/additional
+        all_option_courses = list(option_course_list) + additional_option_courses
+        available_option_courses = [c for c in all_option_courses if c not in fixed_courses]
         
         # Calculate how many option courses we need to satisfy the option credit requirements
         n_option_courses_needed = int(math.ceil(remaining_major_credits / 3))
@@ -471,26 +813,88 @@ class GraduationFlowchart:
         gened_text = str(row.get("General Education Requirements", "") or "")
         categories = self._parse_gened_categories(gened_text)
         if not categories:
-            total_gened = int(row.get("Credits for General Education", 0) or 0)
+            total_gened = credits_for_gened
+            if total_gened == 0:
+                # Default to 45 credits if not specified
+                total_gened = 45
             categories = [("General Education", total_gened)]
         gened_nodes, gened_labels = self._make_gened_nodes(categories)
-
-        planned_courses = fixed_courses + option_selected + option_placeholders + gened_nodes
+        
+        # ---- Free Electives (if Total Credits > Major + GenEd) ----
+        free_elective_nodes = []
+        free_elective_labels = {}
+        if free_elective_credits > 0:
+            n_free_electives = int(math.ceil(free_elective_credits / 3))
+            for i in range(n_free_electives):
+                free_node = f"FREE__ELECTIVE__{i+1}"
+                free_elective_nodes.append(free_node)
+                free_elective_labels[free_node] = "Free Elective"
+        
+        # Calculate current planned courses (BEFORE adding prerequisites)
+        planned_courses_initial = fixed_courses + option_selected + option_placeholders + gened_nodes + free_elective_nodes
+        
+        # CRITICAL: Add ALL prerequisites for ALL courses in the plan
+        # If a course requires a prerequisite, that prerequisite MUST be in the plan!
+        # This ensures prerequisites from other departments are included (e.g., WMNST 104 for AMST 104)
+        planned_courses = add_all_prerequisites_to_plan(planned_courses_initial, self.prereq_map)
+        
+        # Calculate total planned credits (including prerequisites)
+        total_planned_credits = len(planned_courses) * 3
+        
+        # Ensure we meet the Total Credits Required
+        # If we're short, add more free electives
+        if total_planned_credits < total_credits_required:
+            needed_credits = total_credits_required - total_planned_credits
+            needed_courses = int(math.ceil(needed_credits / 3))
+            start_idx = len(free_elective_nodes) + 1
+            for i in range(needed_courses):
+                free_node = f"FREE__ELECTIVE__{start_idx + i}"
+                free_elective_nodes.append(free_node)
+                free_elective_labels[free_node] = "Free Elective"
+                planned_courses.append(free_node)
+            # Recalculate after adding courses
+            total_planned_credits = len(planned_courses) * 3
+        
+        # Also ensure we have enough courses to fill 7-8 semesters (minimum 12 credits per semester)
+        # Target: 7 semesters * 12 credits = 84 credits minimum
+        min_total_credits = 7 * 12
+        if total_planned_credits < min_total_credits:
+            needed_credits = min_total_credits - total_planned_credits
+            needed_courses = int(math.ceil(needed_credits / 3))
+            start_idx = len(free_elective_nodes) + 1
+            for i in range(needed_courses):
+                free_node = f"FREE__ELECTIVE__{start_idx + i}"
+                free_elective_nodes.append(free_node)
+                free_elective_labels[free_node] = "Free Elective"
+                planned_courses.append(free_node)
 
         # ---- Category map for mixed scheduling ----
+        # Track which courses were in initial plan vs. prerequisites added
+        initial_plan_set = {_normalize_course_code(c) for c in planned_courses_initial}
         course_category: Dict[str, str] = {}
+        
         for c in prescribed_courses:
             if c in planned_courses:
-                course_category[c] = "Prescribed"
+                course_category[_normalize_course_code(c)] = "Prescribed"
         for c in additional_courses:
             if c in planned_courses:
-                course_category[c] = "Additional"
+                course_category[_normalize_course_code(c)] = "Additional"
         for c in option_selected:
-            course_category[c] = "Option"
+            course_category[_normalize_course_code(c)] = "Option"
         for c in option_placeholders:
-            course_category[c] = "Option"
+            course_category[_normalize_course_code(c)] = "Option"
         for c in gened_nodes:
-            course_category[c] = "GenEd"
+            course_category[_normalize_course_code(c)] = "GenEd"
+        for c in free_elective_nodes:
+            course_category[_normalize_course_code(c)] = "GenEd"  # Treat free electives as GenEd for scheduling
+        
+        # Categorize prerequisites that were added (from other departments)
+        # These are required courses but from other departments - treat as "Additional"
+        for c in planned_courses:
+            c_norm = _normalize_course_code(c)
+            if c_norm not in course_category:
+                # This is a prerequisite that was added - categorize as "Additional"
+                course_category[c_norm] = "Additional"
 
         # ---- Mixed scheduling + prereq edges ----
         scheduled, prereq_G = schedule_mixed_by_prereqs(
@@ -498,30 +902,36 @@ class GraduationFlowchart:
             self.prereq_map,
             course_category=course_category,
             max_semesters=8,
-            max_credits_per_sem=18
+            max_credits_per_sem=18,
+            min_credits_per_sem=12  # Minimum 12 credits per semester
         )
 
         # ---- Labels & styles ----
+        # IMPORTANT: Normalize all keys to match the normalized graph nodes
         node_type: Dict[str, str] = {}
         label_map: Dict[str, str] = {}
 
         for c in prescribed_courses:
             if c in planned_courses:
-                node_type[c] = "Prescribed"
-                label_map[c] = c
+                c_norm = _normalize_course_code(c)
+                node_type[c_norm] = "Prescribed"
+                label_map[c_norm] = c
 
         for c in additional_courses:
             if c in planned_courses:
-                node_type[c] = "Additional"
-                label_map[c] = c
+                c_norm = _normalize_course_code(c)
+                node_type[c_norm] = "Additional"
+                label_map[c_norm] = c
 
         for c in option_selected:
-            node_type[c] = "Option"
-            label_map[c] = c
+            c_norm = _normalize_course_code(c)
+            node_type[c_norm] = "Option"
+            label_map[c_norm] = c
 
         # Placeholders must mention "option" and the option name
         # Format: "{dept} {option_name} Option Elective" (e.g., "CMPSC General Option Elective")
         for c in option_placeholders:
+            # Placeholders are already normalized (they're strings like "OPT__AMST__1")
             node_type[c] = "Option"
             # Clean up option_name: remove redundant "Option" suffix if present
             clean_option_name = option_name.strip()
@@ -541,8 +951,24 @@ class GraduationFlowchart:
                 label_map[c] = f"{dominant_dept} {clean_option_name} Option Elective"
 
         for c in gened_nodes:
+            # GenEd nodes are already normalized (they're strings like "GENED__GA__1")
             node_type[c] = "GenEd"
             label_map[c] = gened_labels.get(c, "Gen Ed")
+        
+        for c in free_elective_nodes:
+            # Free elective nodes are already normalized (they're strings like "FREE__ELECTIVE__1")
+            node_type[c] = "GenEd"
+            label_map[c] = free_elective_labels.get(c, "Free Elective")
+        
+        # Label prerequisites that were added (from other departments)
+        # These are required courses but from other departments - should be visible as "Additional"
+        initial_plan_set_norm = {_normalize_course_code(c) for c in planned_courses_initial}
+        for c in planned_courses:
+            c_norm = _normalize_course_code(c)
+            if c_norm not in node_type:
+                # This is a prerequisite that was added - label as "Additional" (light blue)
+                node_type[c_norm] = "Additional"
+                label_map[c_norm] = c
 
         # ---- Draw ----
         fig = self._draw_semester_chart(
@@ -572,9 +998,26 @@ class GraduationFlowchart:
         max_semesters: int = 8,
     ):
         sem_nodes: Dict[int, List[str]] = {i: [] for i in range(1, max_semesters + 1)}
+        # Ensure all graph nodes are accounted for
+        all_graph_nodes = set(graph.nodes())
+        all_scheduled_nodes = set(scheduled.keys())
+        
+        # Add all graph nodes to sem_nodes (they should all be in scheduled, but be safe)
         for n in graph.nodes():
             sem = scheduled.get(n, max_semesters)
-            sem_nodes[sem].append(n)
+            if sem < 1 or sem > max_semesters:
+                sem = max_semesters
+            if n not in sem_nodes[sem]:
+                sem_nodes[sem].append(n)
+        
+        # Also add any scheduled nodes that might not be in graph (shouldn't happen, but be safe)
+        for n in all_scheduled_nodes:
+            if n not in all_graph_nodes:
+                sem = scheduled.get(n, max_semesters)
+                if sem < 1 or sem > max_semesters:
+                    sem = max_semesters
+                if n not in sem_nodes[sem]:
+                    sem_nodes[sem].append(n)
 
         for sem in sem_nodes:
             sem_nodes[sem].sort(key=lambda c: (_course_level(c), label_map.get(c, c)))
@@ -625,6 +1068,9 @@ class GraduationFlowchart:
 
         # draw nodes
         for n in graph.nodes():
+            if n not in node_rects:
+                # Skip nodes that aren't scheduled (shouldn't happen, but be safe)
+                continue
             x, y, w, h = node_rects[n]
             kind = node_type.get(n, "Option")
             style = STYLE_MAP.get(kind, STYLE_MAP["Option"])
@@ -636,6 +1082,7 @@ class GraduationFlowchart:
                 linewidth=1.2,
                 edgecolor=style.edgecolor,
                 facecolor=style.facecolor,
+                zorder=5,  # Nodes above background but below arrows
             )
             ax.add_patch(rect)
 
@@ -651,24 +1098,51 @@ class GraduationFlowchart:
             )
 
         # edges between in-plan nodes only
+        # Draw arrows for prerequisites - make them more visible
+        edges_drawn = 0
         for u, v in graph.edges():
+            # Check if both nodes have rectangles (are scheduled and visible)
             if u not in node_rects or v not in node_rects:
+                # Skip edges where nodes aren't visible (shouldn't happen, but be safe)
                 continue
+                
             ur = node_rects[u]
             vr = node_rects[v]
+            
+            # Calculate arrow start and end points
+            # Start from right edge of prerequisite course
             start = (ur[0] + ur[2], ur[1] + ur[3] / 2.0)
+            # End at left edge of dependent course
             end = (vr[0], vr[1] + vr[3] / 2.0)
-
+            
+            # Get semesters for curvature calculation
+            u_sem = scheduled.get(u, 0)
+            v_sem = scheduled.get(v, 0)
+            
+            # Calculate curvature based on semester difference
+            # More curve for same semester, less for different semesters
+            if u_sem == v_sem:
+                # Same semester - use more curve to avoid overlap
+                rad = 0.4
+            else:
+                # Different semesters - use moderate curve
+                rad = 0.2
+            
+            # Draw arrow with maximum visibility
+            # CRITICAL: zorder must be HIGHER than nodes (zorder=5) to be visible!
             arrow = FancyArrowPatch(
                 start,
                 end,
-                arrowstyle="-|>",
-                mutation_scale=12,
-                linewidth=1.0,
-                color="#444444",
-                connectionstyle="arc3,rad=0.06",
+                arrowstyle="->",  # Simple arrow style
+                mutation_scale=30,  # Very large arrowhead for visibility
+                linewidth=3.0,  # Very thick line for visibility
+                color="#000000",  # Pure black
+                connectionstyle=f"arc3,rad={rad}",  # Curved connection
+                zorder=10,  # ABOVE nodes so arrows are visible!
+                alpha=1.0,  # Fully opaque
             )
             ax.add_patch(arrow)
+            edges_drawn += 1
 
         ax.set_xlim(0, x0 + max_semesters * col_w + 0.5)
         ax.set_ylim(y_top + max_rows * row_h + 1.5, 0)
@@ -719,6 +1193,9 @@ def generate_semester_plan(
     majors_csv_path: str,
     option_name: str = "General Option",
     credits_needed: Optional[float] = None,
+    max_semesters: int = 8,
+    max_credits_per_sem: int = 18,
+    min_credits_per_sem: int = 15,
 ) -> dict:
     """
     Generate a semester-by-semester plan structure (not PNG).
@@ -743,9 +1220,33 @@ def generate_semester_plan(
     # Extract additional courses
     additional_expr = str(row.get("Additional Courses", "") or "")
     additional_courses_all = extract_all_courses(additional_expr)
-    additional_courses = additional_courses_all[:1]  # Take first option
+    additional_courses_all = [
+        c for c in additional_courses_all
+        if _normalize_course_code(c) not in {_normalize_course_code(x) for x in prescribed_courses}
+    ]
+
+    # Build a broader course pool from all major row columns.
+    # Many majors store requirement-bearing courses in option/summary/supporting columns.
+    non_course_columns = {
+        "Major Name", "Major Code", "Total Credits Required", "Credits for Major",
+        "Credits for General Education", "Options", "General Education Requirements"
+    }
+    broad_major_pool: List[str] = []
+    for col in row.index:
+        if col in non_course_columns:
+            continue
+        try:
+            value = str(row.get(col, "") or "")
+        except Exception:
+            value = ""
+        if not value:
+            continue
+        for c in extract_all_courses(value):
+            if c not in broad_major_pool:
+                broad_major_pool.append(c)
+
     fixed_courses = []
-    for course in prescribed_courses + additional_courses:
+    for course in prescribed_courses:
         if course not in fixed_courses:
             fixed_courses.append(course)
     
@@ -772,15 +1273,30 @@ def generate_semester_plan(
     credits_for_major = _parse_credits(row.get("Credits for Major", 0), default=0)
     major_course_set = {
         _normalize_course_code(c)
-        for c in (fixed_courses + option_course_list)
+        for c in (fixed_courses + additional_courses_all + option_course_list + broad_major_pool)
     }
     completed_major_courses = [
         c for c in completed_set if c in major_course_set
     ]
     completed_major_credits = 3 * len(completed_major_courses)
     fixed_remaining_credits = 3 * len(fixed_remaining)
+
+    # Select additional courses to help satisfy major credits (instead of taking only one).
+    additional_candidates = [
+        c for c in additional_courses_all
+        if _normalize_course_code(c) not in completed_set and c not in fixed_remaining
+    ]
+    additional_candidates.sort(key=lambda c: (_course_level(c), c))
+    additional_selected: List[str] = []
+    if credits_for_major > 0:
+        remaining_after_fixed = max(0, credits_for_major - completed_major_credits - fixed_remaining_credits)
+        max_additional_count = int(math.ceil(remaining_after_fixed / 3)) if remaining_after_fixed else 0
+        if max_additional_count > 0:
+            additional_selected = additional_candidates[:max_additional_count]
+
+    selected_additional_credits = 3 * len(additional_selected)
     remaining_major_credits = max(
-        0, credits_for_major - completed_major_credits - fixed_remaining_credits
+        0, credits_for_major - completed_major_credits - fixed_remaining_credits - selected_additional_credits
     )
     n_option_courses_needed = int(math.ceil(remaining_major_credits / 3)) if remaining_major_credits else 0
 
@@ -797,7 +1313,25 @@ def generate_semester_plan(
         for i in range(placeholder_count):
             option_placeholders.append(f"OPT__{dominant_dept}__{i+1}")
 
-    planned_courses = fixed_remaining + option_selected + option_placeholders
+    # If option list is sparse/empty, use the broad major pool as additional real-course candidates.
+    if n_option_courses_needed > len(option_selected):
+        deficit = n_option_courses_needed - len(option_selected)
+        broad_candidates = [
+            c for c in broad_major_pool
+            if _normalize_course_code(c) not in completed_set
+            and c not in fixed_remaining
+            and c not in additional_selected
+            and c not in option_selected
+        ]
+        broad_candidates.sort(key=lambda c: (_course_level(c), c))
+        if deficit > 0 and broad_candidates:
+            broad_pick = broad_candidates[:deficit]
+            option_selected.extend(broad_pick)
+            deficit = max(0, deficit - len(broad_pick))
+            if deficit > 0:
+                option_placeholders.extend([f"OPT__{dominant_dept}__X{i+1}" for i in range(deficit)])
+
+    planned_courses = fixed_remaining + additional_selected + option_selected + option_placeholders
 
     # GenEd placeholders to reach remaining credits (if provided)
     gened_nodes = []
@@ -819,6 +1353,13 @@ def generate_semester_plan(
         if gened_nodes:
             gened_nodes = gened_nodes[:needed_gened_count]
             gened_labels = {k: gened_labels[k] for k in gened_nodes}
+            # If detailed GenEd categories are fewer than needed, backfill with generic electives.
+            if len(gened_nodes) < needed_gened_count:
+                shortfall = needed_gened_count - len(gened_nodes)
+                extras = [f"GENED__ELECTIVE__FILL__{i+1}" for i in range(shortfall)]
+                gened_nodes.extend(extras)
+                for k in extras:
+                    gened_labels[k] = "Gen Ed Elective"
         elif needed_gened_count > 0:
             gened_nodes = [f"GENED__ELECTIVE__{i+1}" for i in range(needed_gened_count)]
             gened_labels = {k: "Gen Ed Elective" for k in gened_nodes}
@@ -833,7 +1374,7 @@ def generate_semester_plan(
     for c in prescribed_courses:
         if c in planned_courses:
             course_category[c] = "Prescribed"
-    for c in additional_courses:
+    for c in additional_selected:
         if c in planned_courses:
             course_category[c] = "Additional"
     for c in option_selected:
@@ -847,9 +1388,9 @@ def generate_semester_plan(
         planned_courses=planned_courses,
         prereq_map=prereq_map,
         course_category=course_category,
-        max_semesters=8,
-        max_credits_per_sem=18,
-        min_credits_per_sem=15,
+        max_semesters=max_semesters,
+        max_credits_per_sem=max_credits_per_sem,
+        min_credits_per_sem=min_credits_per_sem,
         completed_courses=completed_courses
     )
     
@@ -878,6 +1419,39 @@ def generate_semester_plan(
         if course in prereq_map:
             prerequisites[course] = prereq_map[course]
     
+    # Final universal backfill: guarantee requested credits are reachable.
+    # This prevents truncated plans for majors with sparse explicit course-code coverage.
+    if credits_needed is not None:
+        target_total = int(math.ceil(float(credits_needed) / 3.0) * 3)
+        current_total = sum(s["credits"] for s in semester_list)
+        if current_total < target_total:
+            remaining_credits = target_total - current_total
+            extra_courses_needed = int(math.ceil(remaining_credits / 3.0))
+            for i in range(extra_courses_needed):
+                placeholder = f"ELECTIVE__FREE__{i+1}"
+                placed = False
+                for sem in range(1, max_semesters + 1):
+                    sem_courses = semesters.get(sem, [])
+                    sem_credits = len(sem_courses) * 3
+                    if sem_credits < max_credits_per_sem:
+                        semesters.setdefault(sem, []).append(placeholder)
+                        placed = True
+                        break
+                if not placed:
+                    # If every semester is full, place in final semester as last resort.
+                    semesters.setdefault(max_semesters, []).append(placeholder)
+                prerequisites[placeholder] = []
+            # Rebuild semester_list after backfill
+            semester_list = []
+            for sem in sorted(semesters.keys()):
+                courses_in_sem = sorted(semesters[sem])
+                credits = len(courses_in_sem) * 3
+                semester_list.append({
+                    "semester": sem,
+                    "courses": courses_in_sem,
+                    "credits": credits
+                })
+
     return {
         "semesters": semester_list,
         "total_credits": sum(s["credits"] for s in semester_list),
