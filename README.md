@@ -4,6 +4,8 @@
 
 The project is built around a practical AI engineering pattern: use LLMs for reasoning, planning, and synthesis, while keeping critical academic logic deterministic, observable, and tool-driven.
 
+Hosted on AWS : https://3.145.213.72/ 
+
 ## Overview
 
 IAAS supports:
