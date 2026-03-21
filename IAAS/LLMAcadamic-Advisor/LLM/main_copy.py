@@ -30,6 +30,16 @@ import pandas as pd
 
 
 from graphExperiment import course_graph, get_course_prerequisites, get_major_course_codes
+from orchestration_pipeline import (
+    ExecutorResult,
+    OrchestrationPlan,
+    run_three_stage_pipeline,
+)
+from web_search_pipeline import (
+    ResolvedResearchAnswer,
+    clear_active_search_context,
+    run_search_pipeline,
+)
 
 
 # =========================
@@ -43,11 +53,14 @@ policy_retriever = None  # For advising/registrar policy PDF queries
 policy_vectorstore = None
 llm1 = None
 llm2 = None
-llm_classifier = None  # Faster model for intent classification (gpt-4o-mini)
+llm_classifier = None  # Shared reasoning/orchestration model
 has_transcript = False
 stored_pdf_docs = None  # Store original PDF docs for deterministic extraction
 latest_student_data = None  # Cache most recent extracted student data
 execution_trace_store = {}  # Per-session lightweight execution traces
+
+PRIMARY_MODEL_NAME = os.getenv("ADVISOR_MODEL_NAME", "gpt-5.4-mini")
+CLASSIFIER_MODEL_NAME = os.getenv("ADVISOR_CLASSIFIER_MODEL_NAME", PRIMARY_MODEL_NAME)
 
 # Absolute paths for Chroma persistence
 LLM_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -271,6 +284,20 @@ def _contextualize_policy_question(user_question: str, conversation_history: Opt
     return q
 
 
+def _get_current_datetime_context() -> str:
+    now = datetime.now()
+    if now.month <= 5:
+        current_term = "Spring"
+    elif now.month <= 8:
+        current_term = "Summer"
+    else:
+        current_term = "Fall"
+    return (
+        f"Current local date/time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}. "
+        f"Treat 'current semester' as {current_term} {now.year} unless the user specifies another term."
+    )
+
+
 def _infer_term_year_from_context(
     user_question: str,
     conversation_history: Optional[List[dict]] = None
@@ -386,6 +413,22 @@ def _parse_date_candidate(date_text: str, fallback_year: Optional[int] = None) -
     return None
 
 
+def _extract_json_object_from_text(raw_text: str) -> Optional[Dict[str, Any]]:
+    if not raw_text:
+        return None
+    raw = str(raw_text).strip()
+    if "```" in raw:
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start >= 0 and end > start:
+            raw = raw[start:end]
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _build_deadline_search_queries(
     user_question: str,
     conversation_history: Optional[List[dict]] = None
@@ -394,16 +437,52 @@ def _build_deadline_search_queries(
     context_q = _contextualize_policy_question(user_question, conversation_history)
     term, year = _infer_term_year_from_context(user_question, conversation_history)
     year_txt = str(year) if year else ""
-    term_txt = term if term else "current"
+    term_txt = (term or "current").strip()
+    campus_txt = "Penn State Abington" if "abington" in context_q.lower() else "Penn State"
 
-    queries = [
-        f"Penn State {term_txt} {year_txt} late drop deadline",
-        f"site:psu.edu {term_txt} {year_txt} late drop deadline",
-        f"site:pennstate.edu academic calendar {term_txt} {year_txt} late drop",
+    query_variants = [
+        f"{campus_txt} {term_txt} {year_txt} academic calendar late drop",
+        f"{campus_txt} {term_txt} {year_txt} academic calendar drop add",
+        f"{campus_txt} {term_txt} {year_txt} early drop deadline",
+        f"{campus_txt} {term_txt} {year_txt} late drop deadline",
+        f"site:psu.edu {campus_txt} {term_txt} {year_txt} academic calendar",
+        f"site:pennstate.edu {campus_txt} {term_txt} {year_txt} late drop deadline",
+        f"site:psu.edu {campus_txt} {term_txt} {year_txt} drop add deadline",
     ]
-    if "abington" in context_q.lower():
-        queries.insert(1, f"Penn State Abington {term_txt} {year_txt} late drop deadline")
-    return queries
+
+    deduped: List[str] = []
+    seen = set()
+    for query in query_variants:
+        cleaned = " ".join(query.split()).strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            deduped.append(cleaned)
+    return deduped[:8]
+
+
+def _lookup_exact_deadline_dates(
+    user_question: str,
+    conversation_history: Optional[List[dict]] = None,
+    trace: Optional[Dict[str, Any]] = None,
+    user_id: str = "default",
+) -> Optional[str]:
+    """Look up exact deadline dates through the shared research pipeline."""
+    contextual_question = _contextualize_policy_question(user_question, conversation_history)
+    result = _run_shared_search_pipeline(
+        user_id=user_id,
+        question_text=contextual_question,
+        conversation_history=conversation_history,
+        trace=trace,
+        preferred_strategy="deadline_exact_date",
+        preferred_domains=["abington.psu.edu", "psu.edu", "pennstate.edu"],
+        required_domain_mode="strict",
+    )
+    answer_text = _research_answer_text(result)
+    if not answer_text:
+        return None
+    if _response_indicates_no_answer_found(answer_text) and not result.source_urls:
+        return None
+    return answer_text
 
 
 def _build_identity_search_queries(user_question: str) -> List[str]:
@@ -884,179 +963,37 @@ def _web_search_and_synthesize(
     conversation_history: Optional[List[dict]] = None,
     prefer_current_or_future: bool = False,
     trace: Optional[Dict[str, Any]] = None,
-    force_fresh_identity: bool = False
+    force_fresh_identity: bool = False,
+    user_id: str = "default",
 ) -> Optional[str]:
-    """
-    Run web search for Penn State / academic questions when our data doesn't have the answer.
-    Returns synthesized response or None if search fails.
-    """
-    global llm2
+    """Run the shared research pipeline and return the synthesized answer text."""
     try:
-        normalized_question = _normalize_question_for_search(user_question)
-        domain_hints = _extract_domain_hints(normalized_question)
-        _trace_tool(
-            trace,
-            "duckduckgo_search",
-            "web retrieval",
-            metadata={"date_only": date_only, "prefer_current_or_future": prefer_current_or_future}
-        )
+        strategy = "generic_authoritative_lookup"
+        required_domain_mode = None
+        preferred_domains = None
         if date_only:
-            term, target_year = _infer_term_year_from_context(normalized_question, conversation_history)
-            queries = _build_deadline_search_queries(normalized_question, conversation_history)
-            ql = (normalized_question or "").lower()
-            strict_target_year = target_year is not None and any(
-                k in ql for k in ["current semester", "this semester", "next semester", "upcoming semester", "spring", "summer", "fall", "winter"]
-            )
-            strict_current_or_future = any(
-                k in ql for k in ["current semester", "this semester", "next semester", "upcoming semester"]
-            )
-            _trace_event(
-                trace,
-                "execute",
-                "Built targeted date queries",
-                {
-                    "term": term,
-                    "target_year": target_year,
-                    "query_count": len(queries),
-                    "strict_target_year": strict_target_year,
-                    "strict_current_or_future": strict_current_or_future,
-                }
-            )
-            all_results = _run_multi_query_web_search(
-                queries[:4],
-                trace=trace,
-                max_per_query=4,
-                domain_hints=domain_hints,
-                require_domain_match=bool(domain_hints)
-            )
-
-            if not all_results:
-                _trace_quality_check(trace, "web_results_non_empty", False, {"mode": "date_only"})
-                return "DATE_NOT_FOUND"
-
-            ranked = _rank_deadline_date_candidates(
-                all_results,
-                target_year=target_year,
-                prefer_current_or_future=prefer_current_or_future,
-                strict_target_year=strict_target_year,
-                strict_current_or_future=strict_current_or_future
-            )
-            _trace_quality_check(
-                trace,
-                "date_candidates_found",
-                len(ranked) > 0,
-                {"candidates": len(ranked), "target_year": target_year}
-            )
-            if ranked:
-                best = ranked[0][0]
-                return best.strftime("%B %d, %Y")
-
-            # Fallback: let LLM pick a concrete late-drop date from snippets when heuristic ranking is inconclusive.
-            search_context = "\n\n".join(
-                f"[{i+1}] {r.get('title', '')}\n{r.get('body', '')}\nSource: {r.get('href', '')}"
-                for i, r in enumerate(all_results[:8])
-            )
-            extracted = llm2.invoke([
-                SystemMessage(content="""Extract the exact late-drop deadline date from the provided search snippets.
-Rules:
-- Return ONLY one date in format: Month DD, YYYY
-- The date must match the asked term/year if provided
-- Prefer Penn State official sources
-- If uncertain, return exactly: DATE_NOT_FOUND"""),
-                HumanMessage(content=f"Question: {user_question}\n\nSearch snippets:\n{search_context}")
-            ]).content.strip()
-            if extracted and extracted.lower() != "date_not_found":
-                parsed = _parse_date_candidate(extracted, fallback_year=target_year or datetime.now().year)
-                if parsed:
-                    return parsed.strftime("%B %d, %Y")
-            return "DATE_NOT_FOUND"
-
-        if force_fresh_identity:
-            role_keywords = ["chancellor", "program chair", "chair", "computer science", "leadership", "provost"]
-            queries = _build_identity_search_queries(normalized_question)
-            gathered: List[dict] = []
-            gathered = _run_multi_query_web_search(
-                queries,
-                trace=trace,
-                max_per_query=5,
-                domain_hints=domain_hints,
-                require_domain_match=bool(domain_hints)
-            )
-
-            if not gathered:
-                # Deterministic fallback to official leadership pages.
-                direct = _fetch_official_role_holder(normalized_question, domain_hints, trace=trace)
-                if direct:
-                    return direct
-                _trace_quality_check(trace, "web_results_non_empty", False, {"mode": "identity"})
-                return "I couldn't verify the current office holder.\nSource: unavailable"
-
-            ranked_results = sorted(
-                gathered,
-                key=lambda r: _rank_identity_result(r, role_keywords),
-                reverse=True
-            )
-            top = ranked_results[:8]
-            _trace_quality_check(trace, "identity_results_ranked", len(top) > 0, {"candidates": len(gathered)})
-
-            # Deterministic pass: extract name from top result snippets first.
-            for r in top[:4]:
-                text = f"{r.get('title', '')}. {r.get('body', '')}"
-                names = _extract_role_holder_candidates(text, role_keywords)
-                if names:
-                    name = names[0]
-                    src = str(r.get("href", "") or "unavailable")
-                    return f"The current office holder appears to be {name}.\nSource: {src}"
-
-            search_context = "\n\n".join(
-                f"[{i+1}] {r.get('title', '')}\n{r.get('body', '')}\nSource: {r.get('href', '')}"
-                for i, r in enumerate(top)
-            )
-            response = llm2.invoke([
-                SystemMessage(content="""You are verifying a potentially time-sensitive staff role answer.
-Use ONLY the web results. Prefer official Penn State pages.
-Return:
-1) The best current answer in one sentence.
-2) A 'Source:' line with the strongest URL from the results.
-If not verifiable, return:
-I couldn't verify the current office holder.
-Source: <best available URL or unavailable>"""),
-                HumanMessage(content=f"Student question: {normalized_question}\n\nWeb search results:\n{search_context}")
-            ]).content
-            if "source:" not in response.lower():
-                best_url = str(top[0].get("href", "") or "unavailable")
-                response = response.strip() + f"\nSource: {best_url}"
-            return response
-
-        query_variants = _build_general_search_queries(normalized_question)
-        results = _run_multi_query_web_search(
-            query_variants,
+            strategy = "deadline_exact_date"
+            preferred_domains = ["abington.psu.edu", "psu.edu", "pennstate.edu"]
+            required_domain_mode = "strict"
+        elif force_fresh_identity:
+            strategy = "identity_current_role"
+        result = _run_shared_search_pipeline(
+            user_id=user_id,
+            question_text=user_question,
+            conversation_history=conversation_history,
             trace=trace,
-            max_per_query=5,
-            domain_hints=domain_hints,
-            require_domain_match=False
+            preferred_strategy=strategy,
+            preferred_domains=preferred_domains,
+            required_domain_mode=required_domain_mode,
         )
-        if not results:
-            _trace_quality_check(trace, "web_results_non_empty", False, {"mode": "generic"})
-            return None
-
-        search_context = "\n\n".join(
-            f"[{i+1}] {r.get('title', '')}\n{r.get('body', '')}\nSource: {r.get('href', '')}"
-            for i, r in enumerate(results[:5])
-        )
-
-        response = llm2.invoke([
-            SystemMessage(content="""You are an academic advisor. The student asked a question that wasn't in our local policy documents.
-Use the web search results below to answer their question. Cite that this is from a web search.
-Be concise and accurate. If the search results don't contain a clear answer, say so.
-Focus on Penn State / academic policy information."""),
-            HumanMessage(content=f"Student question: {normalized_question}\n\nWeb search results:\n{search_context}\n\nProvide a helpful answer:")
-        ]).content
-        return response
+        answer_text = _research_answer_text(result)
+        if not answer_text:
+            return "DATE_NOT_FOUND" if date_only else None
+        return answer_text
     except Exception as e:
         print(f"⚠️ Web search failed: {e}")
-        _trace_tool(trace, "duckduckgo_search", "web retrieval", status="failed", metadata={"error": str(e)})
-        return None
+        _trace_tool(trace, "web_search_pipeline", "shared research pipeline", status="failed", metadata={"error": str(e)})
+        return "DATE_NOT_FOUND" if date_only else None
 
 
 def _observe_and_repair_response(
@@ -1211,6 +1148,43 @@ def _response_has_allowed_source(response: str, domain_hints: List[str]) -> bool
         return False
     return any(_is_domain_allowed(u, domain_hints) for u in urls)
 
+
+def _resolved_search_to_metadata(result: Optional[ResolvedResearchAnswer]) -> Dict[str, Any]:
+    if result is None:
+        return {}
+    return {
+        "search_resolution": result.to_dict(),
+    }
+
+
+def _run_shared_search_pipeline(
+    user_id: str,
+    question_text: str,
+    conversation_history: Optional[List[dict]],
+    trace: Optional[Dict[str, Any]],
+    preferred_strategy: Optional[str] = None,
+    preferred_domains: Optional[List[str]] = None,
+    required_domain_mode: Optional[str] = None,
+) -> ResolvedResearchAnswer:
+    return run_search_pipeline(
+        user_id=user_id,
+        user_question=question_text,
+        corrected_question=question_text,
+        conversation_history=conversation_history,
+        llm=llm2,
+        trace=trace,
+        preferred_strategy=preferred_strategy,
+        preferred_domains=preferred_domains,
+        required_domain_mode=required_domain_mode,
+    )
+
+
+def _research_answer_text(result: Optional[ResolvedResearchAnswer]) -> Optional[str]:
+    if result is None:
+        return None
+    answer = str(result.answer_text or "").strip()
+    return answer or None
+
 def track_collection_creation(collection_name: str, user_id: str):
     """Track when collection was created for TTL cleanup."""
     metadata = {}
@@ -1281,6 +1255,18 @@ def _new_execution_trace(user_id: str, user_question: str, enabled: bool) -> Dic
         "user_question": user_question,
         "started_at": datetime.now().isoformat(),
         "plan": {},
+        "orchestrator": {},
+        "executor": {},
+        "finalizer": {},
+        "search_pipeline": {
+            "context": {},
+            "plan": {},
+            "rounds": [],
+            "sources_considered": [],
+            "sources_used": [],
+            "exhaustion_reason": None,
+            "runs": [],
+        },
         "events": [],
         "tools_used": [],
         "quality_checks": [],
@@ -1337,6 +1323,10 @@ def _trace_quality_check(
 
 def get_execution_trace_for_user(user_id: str) -> Optional[Dict[str, Any]]:
     return execution_trace_store.get(user_id)
+
+
+def clear_search_context_for_user(user_id: str):
+    clear_active_search_context(user_id)
 
 
 class CachedEmbeddings:
@@ -1736,9 +1726,9 @@ def setup_environment(whatIfUpload=None, user_id='default'):
 
     # ---- LLM Instances ----
     global llm1, llm2, llm_classifier
-    llm1 = ChatOpenAI(model_name="gpt-4o", temperature=0)
-    llm2 = ChatOpenAI(model_name="gpt-4o", temperature=0)
-    llm_classifier = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)  # Faster for intent classification
+    llm1 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
+    llm2 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
+    llm_classifier = ChatOpenAI(model_name=CLASSIFIER_MODEL_NAME, temperature=0)
     print(" LLMs initialized.")
 
 
@@ -2154,7 +2144,7 @@ def _classify_intent_llm(
     if llm_classifier is None:
         try:
             from langchain_openai import ChatOpenAI
-            llm_classifier = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
+            llm_classifier = ChatOpenAI(model_name=CLASSIFIER_MODEL_NAME, temperature=0)
         except Exception:
             return "chat"
 
@@ -2276,19 +2266,13 @@ def _extract_requested_semesters(user_question: str, conversation_history: Optio
     return 1
 
 
-def _build_reasoning_plan(
+def _build_reasoning_plan_hardcoded(
     user_question: str,
     conversation_history: Optional[List[dict]],
     has_transcript: bool,
 ) -> Dict[str, object]:
-    """
-    Lightweight reasoning layer:
-      1) What does user want?
-      2) What data is needed?
-      3) How should we deliver?
-    """
+    """Fallback: hardcoded reasoning plan when LLM fails or returns invalid output."""
     q = (user_question or "").lower()
-
     recommendation_terms = [
         "next semester", "upcoming semester", "what should i take next",
         "recommend courses", "recommend me courses", "what should i take",
@@ -2307,10 +2291,7 @@ def _build_reasoning_plan(
         k in recent_context_text for k in ["recommend", "next semester", "courses for next", "semester +1"]
     )
 
-    tools = {
-        "local_retrievers": True,
-        "web_search": False,
-    }
+    tools = {"local_retrievers": True, "web_search": False}
 
     if any(t in q for t in recommendation_terms) or is_followup_recommendation:
         return {
@@ -2342,7 +2323,6 @@ def _build_reasoning_plan(
             "web_search_mode": "never",
         }
 
-    # Fallback to existing router/classifier
     contextual_q = _contextualize_policy_question(user_question, conversation_history)
     routed = route_query(contextual_q, has_transcript=has_transcript, conversation_history=conversation_history)
     if is_academic_or_policy_question(contextual_q):
@@ -2363,6 +2343,152 @@ def _build_reasoning_plan(
         "web_search_mode": web_search_mode,
         "contextual_question": contextual_q,
     }
+
+
+def _build_reasoning_plan(
+    user_question: str,
+    conversation_history: Optional[List[dict]],
+    has_transcript: bool,
+) -> Dict[str, object]:
+    """
+    LLM-based reasoning layer:
+      1) What does user want?
+      2) What data is needed?
+      3) How should we deliver?
+    Falls back to hardcoded logic if LLM fails or returns invalid JSON.
+    """
+    global llm_classifier
+    if llm_classifier is None:
+        try:
+            from langchain_openai import ChatOpenAI
+            llm_classifier = ChatOpenAI(model_name=CLASSIFIER_MODEL_NAME, temperature=0)
+        except Exception:
+            return _build_reasoning_plan_hardcoded(user_question, conversation_history, has_transcript)
+
+    recent_context = ""
+    if conversation_history and len(conversation_history) > 0:
+        recent = conversation_history[-6:]
+        recent_context = "\nRecent conversation:\n" + "\n".join(
+            f"{m.get('role', 'user')}: {str(m.get('content', ''))[:150]}" for m in recent
+        )
+
+    system_prompt = """You are a reasoning layer for an academic advising chatbot. Given the student's question and context, output a JSON object with these exact keys:
+
+- First analyze the user quesry and what they mean by it based on context and coversation history {recent_context}.
+- Then based on the analysis, determine the intent of the user.
+- If the intent is not clear, return "chat".
+- Then based on the intent, determine the needed data, delivery method nd tools rerquired
+
+intent: One of: recommendation, audit, full_plan, policy, course, major, transcript, chat
+  - recommendation: Student wants course recommendations for next/upcoming semester(s)
+  - audit: Student wants to review/analyze their transcript or academic requirements
+  - full_plan: Student wants a full semester-by-semester graduation plan
+  - policy: Institutional rules (deadlines, drop policy, etc.)
+  - course: Specific course info (prereqs, description)
+  - major: Major requirements (catalog lookup)
+  - transcript: Other transcript/planning requests
+  - chat: General questions
+
+- needed_data: Array of strings. Use ["transcript_plan_state"] for recommendation, ["transcript_summary","unmet_requirements"] for audit, ["transcript_or_major_year"] for full_plan, [] otherwise.
+
+- delivery: One of: semester_recommendations, detailed_but_concise_audit, full_semester_plan, default
+  - Match delivery to intent: semester_recommendations for recommendation, detailed_but_concise_audit for audit, full_semester_plan for full_plan, default otherwise.
+
+- semester_horizon: Integer 0-8. Use 1-2 for recommendation (how many semesters ahead), 8 for full_plan, 0 otherwise.
+
+- tools: Object with local_retrievers (boolean, usually true) and web_search (boolean).
+  - web_search: true for policy/academic questions that may need current info; false for transcript-based intents.
+
+- web_search_mode: One of: never, if_missing, verify_current_fact, verify_date
+  - never: For recommendation, audit, full_plan
+  - verify_date: For deadline/date questions (late drop, withdraw)
+  - verify_current_fact: For time-sensitive factual questions
+  - if_missing: For general policy/academic questions
+
+- contextual_question: A refined version of the question for retrieval. For vague follow-ups about deadlines, include prior context. Otherwise use the question as-is.
+
+Output ONLY valid JSON, no markdown or extra text."""
+
+    user_prompt = f"""Student has transcript uploaded: {has_transcript}
+{recent_context}
+
+Current question: "{user_question or ''}"
+
+JSON:"""
+
+    try:
+        response = llm_classifier.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ]).content.strip()
+
+        # Extract JSON from response (handle markdown code blocks)
+        raw = response
+        if "```" in raw:
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                raw = raw[start:end]
+        else:
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                raw = raw[start:end]
+
+        plan = json.loads(raw)
+
+        # Validate and normalize
+        valid_intents = {"recommendation", "audit", "full_plan", "policy", "course", "major", "transcript", "chat"}
+        intent = str(plan.get("intent", "chat")).lower().strip()
+        if intent not in valid_intents:
+            intent = "chat"
+
+        needed_data = plan.get("needed_data")
+        if not isinstance(needed_data, list):
+            needed_data = []
+
+        valid_deliveries = {"semester_recommendations", "detailed_but_concise_audit", "full_semester_plan", "default"}
+        delivery = str(plan.get("delivery", "default")).lower().strip()
+        if delivery not in valid_deliveries:
+            delivery = "default"
+
+        try:
+            horizon = int(plan.get("semester_horizon", 0))
+            horizon = max(0, min(8, horizon))
+        except (TypeError, ValueError):
+            horizon = 0
+
+        tools = plan.get("tools") or {}
+        if not isinstance(tools, dict):
+            tools = {"local_retrievers": True, "web_search": False}
+        tools.setdefault("local_retrievers", True)
+        tools.setdefault("web_search", bool(tools.get("web_search", False)))
+
+        valid_modes = {"never", "if_missing", "verify_current_fact", "verify_date"}
+        web_search_mode = str(plan.get("web_search_mode", "if_missing")).lower().strip()
+        if web_search_mode not in valid_modes:
+            web_search_mode = "if_missing"
+
+        contextual_q = plan.get("contextual_question")
+        if contextual_q is None or not isinstance(contextual_q, str):
+            contextual_q = _contextualize_policy_question(user_question, conversation_history) or user_question
+
+        # For recommendation, ensure semester_horizon is sensible (LLM may miss "next 2 semesters")
+        if intent == "recommendation" and horizon == 0:
+            horizon = _extract_requested_semesters(user_question, conversation_history)
+
+        return {
+            "intent": intent,
+            "needed_data": needed_data,
+            "delivery": delivery,
+            "semester_horizon": horizon,
+            "tools": tools,
+            "web_search_mode": web_search_mode,
+            "contextual_question": str(contextual_q).strip() or user_question,
+        }
+    except Exception as e:
+        print(f"⚠️ LLM reasoning plan failed ({e}), using hardcoded fallback")
+        return _build_reasoning_plan_hardcoded(user_question, conversation_history, has_transcript)
 
 
 def _course_level_num(code: str) -> int:
@@ -2439,6 +2565,72 @@ def _format_plan_structure(plan_structure: dict, start_semester_number: int = 1)
         lines.append(f"Total Credits: {sem.get('credits', len(courses) * 3)}")
         lines.append("---")
     return "\n".join(lines).rstrip("-\n")
+
+
+def _slice_plan_structure(plan_structure: dict, semester_horizon: int) -> dict:
+    if not plan_structure or semester_horizon <= 0:
+        return plan_structure
+    semesters = list(plan_structure.get("semesters", []) or [])
+    sliced_semesters = sorted(semesters, key=lambda s: s.get("semester", 0))[:semester_horizon]
+    return {
+        "semesters": sliced_semesters,
+        "total_credits": sum(int(s.get("credits", 0)) for s in sliced_semesters),
+        "prerequisites": dict(plan_structure.get("prerequisites", {}) or {}),
+    }
+
+
+def _extract_semester_blocks_from_text(plan_text: str) -> List[str]:
+    if not plan_text:
+        return []
+    matches = re.finditer(
+        r"((?:[-*]\s*)?(?:\*\*)?Semester\s+\+?\d+:(?:\*\*)?\s*\n.*?(?:[-*]\s*)?(?:\*\*)?Total Credits:(?:\*\*)?\s*\d+)",
+        plan_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    blocks: List[str] = []
+    for match in matches:
+        block = match.group(1).strip()
+        if block:
+            blocks.append(block)
+    return blocks
+
+
+def _find_recent_assistant_plan_text(conversation_history: Optional[List[dict]]) -> Optional[str]:
+    if not conversation_history:
+        return None
+    for msg in reversed(conversation_history):
+        if msg.get("role") != "assistant":
+            continue
+        content = str(msg.get("content", "") or "")
+        if _extract_semester_blocks_from_text(content):
+            return content
+    return None
+
+
+def _slice_semester_plan_text(plan_text: str, semester_horizon: int) -> str:
+    if semester_horizon <= 0:
+        return plan_text
+    blocks = _extract_semester_blocks_from_text(plan_text)
+    if not blocks:
+        return plan_text
+    return "\n---\n".join(blocks[:semester_horizon]).strip()
+
+
+def _build_available_tool_inventory(has_transcript_for_plan: bool) -> List[str]:
+    tools = ["conversation_history", "deterministic_planner", "web_search"]
+    if has_transcript_for_plan:
+        tools.extend(["transcript_state", "transcript_retriever"])
+    if pdf_retriever is not None and "transcript_retriever" not in tools:
+        tools.append("transcript_retriever")
+    if course_retriever is not None:
+        tools.append("course_retriever")
+    if majors_retriever is not None:
+        tools.append("majors_retriever")
+    if policy_retriever is not None:
+        tools.append("policy_retriever")
+    if course_graph is not None:
+        tools.append("prerequisite_graph")
+    return list(dict.fromkeys(tools))
 
 
 def get_student_data_from_transcript() -> Optional[dict]:
@@ -2982,6 +3174,760 @@ YEAR: UNKNOWN"""
         traceback.print_exc()
         return None, None
 
+
+def _extract_major_year_from_request_context(
+    user_question: str,
+    conversation_history: Optional[List[dict]],
+) -> Tuple[Optional[str], Optional[str]]:
+    major_from_text, year_from_text = None, None
+    try:
+        major_from_text, year_from_text = extract_major_and_year_from_text(user_question, conversation_history)
+        if not major_from_text or not year_from_text:
+            simple_major, simple_year = simple_extract_major_and_year(user_question)
+            major_from_text = major_from_text or simple_major
+            year_from_text = year_from_text or simple_year
+        if not year_from_text:
+            year_from_text = _fuzzy_year_from_text(user_question)
+    except Exception as e:
+        print(f"⚠️ Error extracting major/year from request context: {e}")
+    return major_from_text, year_from_text
+
+
+def _extract_major_year_from_conversation_history(
+    conversation_history: Optional[List[dict]],
+) -> Tuple[Optional[str], Optional[str]]:
+    if not conversation_history:
+        return None, None
+
+    major = None
+    year = None
+
+    for preferred_role in ("user", "assistant"):
+        for message in reversed(conversation_history):
+            if message.get("role") != preferred_role:
+                continue
+            content = str(message.get("content", "") or "").strip()
+            if not content:
+                continue
+
+            simple_major, simple_year = simple_extract_major_and_year(content)
+            if simple_major and not major:
+                major = simple_major
+            if simple_year and not year:
+                year = _normalize_year_token(simple_year) or simple_year
+            if not year:
+                fuzzy_year = _fuzzy_year_from_text(content)
+                if fuzzy_year:
+                    year = fuzzy_year
+            if major and year:
+                return major, year
+
+    user_text = "\n".join(
+        str(message.get("content", "") or "")
+        for message in conversation_history
+        if message.get("role") == "user"
+    ).strip()
+    if user_text:
+        simple_major, simple_year = simple_extract_major_and_year(user_text)
+        major = major or simple_major
+        year = year or (_normalize_year_token(simple_year) if simple_year else None) or _fuzzy_year_from_text(user_text)
+
+    return major, year
+
+
+def _build_conversation_profile_recall_draft(
+    conversation_history: Optional[List[dict]],
+    student_data: Optional[dict],
+) -> str:
+    major, year = _extract_major_year_from_conversation_history(conversation_history)
+    if student_data:
+        major = major or student_data.get("major")
+
+    if major and year:
+        return f"From earlier in our conversation, you said you're a {year} majoring in {major}."
+    if year:
+        return f"From earlier in our conversation, you said you're a {year}. I don't have your major with confidence."
+    if major:
+        return f"From earlier in our conversation, you said your major is {major}. I don't have your year level with confidence."
+    return "I couldn't determine your year level and major from the earlier conversation with enough confidence."
+
+
+def _build_reasoning_support_context(
+    plan: OrchestrationPlan,
+    conversation_history: Optional[List[dict]],
+    student_data: Optional[dict],
+    draft_response: str,
+    metadata: Optional[Dict[str, Any]],
+) -> str:
+    sections: List[str] = []
+    metadata = metadata or {}
+
+    sections.append(
+        "Reason from the user's request and conversation history first. "
+        "Treat any helper-generated draft as supporting evidence, not the only valid path."
+    )
+
+    major_from_history, year_from_history = _extract_major_year_from_conversation_history(conversation_history)
+    recovered_facts = []
+    if year_from_history:
+        recovered_facts.append(f"year={year_from_history}")
+    if major_from_history:
+        recovered_facts.append(f"major={major_from_history}")
+    if recovered_facts:
+        sections.append("Recovered conversation facts: " + ", ".join(recovered_facts))
+
+    if not plan.use_tools:
+        recent_plan = _find_recent_assistant_plan_text(conversation_history)
+        if recent_plan:
+            sections.append("Relevant prior plan from the conversation:\n" + recent_plan[:2500])
+
+    if student_data:
+        transcript_facts = []
+        if student_data.get("major"):
+            transcript_facts.append(f"transcript_major={student_data.get('major')}")
+        if student_data.get("credits_completed") is not None:
+            transcript_facts.append(f"credits_completed={student_data.get('credits_completed')}")
+        if student_data.get("credits_needed") is not None:
+            transcript_facts.append(f"credits_needed={student_data.get('credits_needed')}")
+        if transcript_facts:
+            sections.append("Transcript facts: " + ", ".join(transcript_facts))
+
+    if plan.executor_path == "conversation_plan_slice":
+        prior_plan = _find_recent_assistant_plan_text(conversation_history)
+        if prior_plan:
+            sections.append("Most recent semester-by-semester plan from the conversation:\n" + prior_plan[:3500])
+        if draft_response:
+            sections.append("Deterministic helper suggestion for the requested scope:\n" + draft_response[:1500])
+    elif draft_response:
+        sections.append("Supporting draft or retrieved answer:\n" + draft_response[:1500])
+
+    source = metadata.get("source")
+    if source:
+        sections.append(f"Draft source: {source}")
+
+    search_resolution = metadata.get("search_resolution")
+    if isinstance(search_resolution, dict):
+        source_urls = list(search_resolution.get("source_urls") or [])
+        if source_urls:
+            sections.append("Verified web sources: " + ", ".join(source_urls[:4]))
+        if search_resolution.get("exhaustion_reason"):
+            sections.append(f"Search exhaustion reason: {search_resolution.get('exhaustion_reason')}")
+
+    return "\n\n".join(section for section in sections if section).strip()
+
+
+def _build_transcript_plan_draft(
+    plan: OrchestrationPlan,
+    user_question: str,
+    conversation_history: Optional[List[dict]],
+    has_transcript_for_plan: bool,
+) -> Tuple[str, List[str], Dict[str, Any]]:
+    tools_used = ["deterministic_planner"]
+
+    if has_transcript_for_plan:
+        full_plan_text = aggregate_and_generate_response(user_question)
+        if plan.plan_scope in {"single_semester", "multi_semester"}:
+            sliced = _slice_semester_plan_text(full_plan_text, plan.semester_horizon)
+            if sliced:
+                return sliced, ["transcript_state"] + tools_used, {"source": "transcript_plan"}
+        return full_plan_text, ["transcript_state"] + tools_used, {"source": "transcript_plan"}
+
+    major_from_text, year_from_text = _extract_major_year_from_request_context(
+        plan.corrected_question or user_question,
+        conversation_history,
+    )
+    if not major_from_text or not year_from_text:
+        return (
+            "I need your major and year level to build that plan. For example: 'Business sophomore' or 'Computer Science junior'.",
+            [],
+            {"source": "missing_major_year"},
+        )
+
+    full_plan_text = generate_plan_from_major_and_year(major_from_text, year_from_text)
+    if plan.plan_scope in {"single_semester", "multi_semester"}:
+        sliced = _slice_semester_plan_text(full_plan_text, plan.semester_horizon)
+        if sliced:
+            return sliced, tools_used, {"source": "major_year_plan", "major": major_from_text, "year": year_from_text}
+    return full_plan_text, tools_used, {"source": "major_year_plan", "major": major_from_text, "year": year_from_text}
+
+
+def _build_transcript_audit_draft(student_data: Optional[dict], user_question: str) -> str:
+    if not student_data:
+        return "I couldn't read a transcript. Please upload one so I can answer transcript-specific questions."
+
+    credits_needed = student_data.get("credits_needed", "unknown")
+    credits_completed = student_data.get("credits_completed", "unknown")
+    unmet = student_data.get("unmet_requirements", [])
+    if unmet and all(
+        isinstance(x, dict) and x.get("category", "").strip().lower() in {"", "requirement"}
+        for x in unmet
+    ) and stored_pdf_docs:
+        try:
+            parsed_unmet = extract_not_satisfied_sections(stored_pdf_docs)
+            if parsed_unmet:
+                unmet = parsed_unmet
+        except Exception as e:
+            print(f"⚠️ Could not enrich unmet requirement details: {e}")
+
+    def _format_unmet_item(item) -> str:
+        if isinstance(item, dict):
+            category = str(item.get("category", "Requirement")).strip() or "Requirement"
+            needed = item.get("needed", 0)
+            used = item.get("used", None)
+            required = item.get("required", None)
+            if required is not None and used is not None:
+                return f"- {category}: {needed} credits needed ({used}/{required} completed)"
+            return f"- {category}: {needed} credits needed"
+        if isinstance(item, (list, tuple)):
+            return f"- Requirement: {', '.join(str(x) for x in item)}"
+        return f"- Requirement: {str(item)}"
+
+    unmet_summary = "\n".join(_format_unmet_item(item) for item in unmet[:8]) if unmet else "No unmet requirements found."
+    return (
+        f"Academic Audit Summary\n"
+        f"- Major: {student_data.get('major', 'Unknown')}\n"
+        f"- Credits completed: {credits_completed}\n"
+        f"- Credits remaining: {credits_needed}\n"
+        f"- In-progress courses: {', '.join(student_data.get('in_progress_courses', [])[:8]) if student_data.get('in_progress_courses') else 'None'}\n"
+        f"- Recently completed courses: {', '.join(student_data.get('completed_courses', [])[-8:]) if student_data.get('completed_courses') else 'Not detected'}\n"
+        f"- Key unmet requirements:\n{unmet_summary}\n\n"
+        f"Next step: ask 'recommend me courses for next 2 semesters' for concrete scheduling, or ask for a full graduation plan."
+    )
+
+
+def _build_course_lookup_draft(user_question: str, trace: Optional[Dict[str, Any]], user_id: str = "default") -> Tuple[str, List[str], Dict[str, Any]]:
+    return _build_course_lookup_draft_with_tools(user_question, trace, None, user_id=user_id)
+
+
+def _build_course_lookup_draft_with_tools(
+    user_question: str,
+    trace: Optional[Dict[str, Any]],
+    allowed_tools: Optional[set],
+    user_id: str = "default",
+) -> Tuple[str, List[str], Dict[str, Any]]:
+    expanded_question = _expand_academic_query_terms(user_question)
+    course_match = re.search(r'\b([A-Z]{2,})\s+(\d{3}[A-Z]?)\b', user_question, re.IGNORECASE)
+    if course_match and (allowed_tools is None or "prerequisite_graph" in allowed_tools):
+        course_code = f"{course_match.group(1).upper()} {course_match.group(2)}"
+        try:
+            if course_graph:
+                prereq_text = get_course_prerequisites(course_code, course_graph)
+                return prereq_text, ["prerequisite_graph"], {"source": "prerequisite_graph"}
+        except Exception as e:
+            print(f"⚠️ Could not fetch prerequisites from graph: {e}")
+
+    if allowed_tools is None or "course_retriever" in allowed_tools:
+        course_info = process_psu_courses(expanded_question)
+        if course_info and "No relevant courses found" not in course_info and "not available" not in course_info.lower():
+            return course_info, ["course_retriever"], {"source": "course_retriever"}
+
+    if allowed_tools is None or "web_search" in allowed_tools:
+        search_result = _run_shared_search_pipeline(
+            user_id=user_id,
+            question_text=expanded_question,
+            conversation_history=None,
+            trace=trace,
+            preferred_strategy="generic_authoritative_lookup",
+            preferred_domains=["psu.edu", "pennstate.edu"],
+            required_domain_mode="preferred",
+        )
+        web_response = _research_answer_text(search_result)
+        if web_response:
+            return web_response, ["web_search"], {
+                "source": "shared_search_pipeline",
+                **_resolved_search_to_metadata(search_result),
+            }
+    return "I couldn't find that course. Please check the code (for example, 'CMPSC 131').", [], {"source": "course_lookup_not_found"}
+
+
+def _build_policy_lookup_draft(
+    user_question: str,
+    conversation_history: Optional[List[dict]],
+    trace: Optional[Dict[str, Any]],
+    allowed_tools: Optional[set] = None,
+    retry_reason: Optional[str] = None,
+    user_id: str = "default",
+) -> Tuple[str, List[str], Dict[str, Any]]:
+    response = None
+    tools_used: List[str] = []
+    metadata: Dict[str, Any] = {"source": "policy_lookup"}
+    contextual_question = user_question
+    execution_profile = _build_execution_profile(
+        contextual_question,
+        "policy",
+        {"tools": {"web_search": True}},
+    )
+    requires_exact_date = execution_profile.get("verification_mode") == "date"
+
+    if requires_exact_date and (allowed_tools is None or "web_search" in allowed_tools):
+        search_result = _run_shared_search_pipeline(
+            user_id=user_id,
+            question_text=contextual_question,
+            conversation_history=conversation_history,
+            trace=trace,
+            preferred_strategy="deadline_exact_date",
+            preferred_domains=["abington.psu.edu", "psu.edu", "pennstate.edu"],
+            required_domain_mode="strict",
+        )
+        exact_date_response = _research_answer_text(search_result)
+        if exact_date_response:
+            metadata.update(_resolved_search_to_metadata(search_result))
+            return exact_date_response, ["web_search"], metadata
+
+    if (allowed_tools is None or "policy_retriever" in allowed_tools) and policy_retriever:
+        try:
+            policy_docs = policy_retriever.invoke(contextual_question)
+            if policy_docs:
+                tools_used.append("policy_retriever")
+                policy_context = "\n\n".join(doc.page_content[:900] for doc in policy_docs[:4])
+                response = llm2.invoke([
+                    SystemMessage(content="Answer the student's question using ONLY the provided policy text. If the answer is not present, say you could not find it in the policy."),
+                    HumanMessage(content=f"{_get_current_datetime_context()}\nPolicy context:\n{policy_context}\n\nQuestion: {contextual_question}"),
+                ]).content
+
+                if requires_exact_date:
+                    if not _has_concrete_date_in_text(response):
+                        if allowed_tools is None or "web_search" in allowed_tools:
+                            exact_date_response = _lookup_exact_deadline_dates(
+                                contextual_question,
+                                conversation_history=conversation_history,
+                                trace=trace,
+                                user_id=user_id,
+                            )
+                            if exact_date_response:
+                                return exact_date_response, tools_used + ["web_search"], metadata
+                            web_response = _web_search_and_synthesize(
+                                contextual_question,
+                                date_only=True,
+                                conversation_history=conversation_history,
+                                prefer_current_or_future=True,
+                                trace=trace,
+                                user_id=user_id,
+                            )
+                            if web_response and web_response != "DATE_NOT_FOUND":
+                                return _format_deadline_answer(web_response, contextual_question, conversation_history), tools_used + ["web_search"], metadata
+                    else:
+                        local_dates = _extract_dates_from_text(response)
+                        if local_dates:
+                            return _format_deadline_answer(local_dates[0], contextual_question, conversation_history), tools_used, metadata
+
+                if not _response_indicates_no_answer_found(response):
+                    return response, tools_used, metadata
+        except Exception as e:
+            print(f"⚠️ Could not retrieve policy information: {e}")
+
+    if allowed_tools is None or "web_search" in allowed_tools:
+        preferred_strategy = "deadline_exact_date" if requires_exact_date else "generic_authoritative_lookup"
+        search_result = _run_shared_search_pipeline(
+            user_id=user_id,
+            question_text=contextual_question,
+            conversation_history=conversation_history,
+            trace=trace,
+            preferred_strategy=preferred_strategy,
+            preferred_domains=["abington.psu.edu", "psu.edu", "pennstate.edu"],
+            required_domain_mode="strict" if requires_exact_date else "preferred",
+        )
+        web_response = _research_answer_text(search_result)
+        if web_response:
+            metadata.update(_resolved_search_to_metadata(search_result))
+            return web_response, tools_used + ["web_search"], metadata
+    return "I couldn't find that policy information. Please rephrase your question or check the Penn State website directly.", tools_used, metadata
+
+
+def _build_major_lookup_draft(
+    user_question: str,
+    trace: Optional[Dict[str, Any]],
+    allowed_tools: Optional[set] = None,
+    user_id: str = "default",
+) -> Tuple[str, List[str], Dict[str, Any]]:
+    if (allowed_tools is None or "majors_retriever" in allowed_tools) and majors_retriever:
+        try:
+            major_docs = majors_retriever.invoke(user_question)
+            if major_docs:
+                major_context = "\n\n".join(doc.page_content[:800] for doc in major_docs[:3])
+                response = llm2.invoke([
+                    SystemMessage(content="Answer the student's question using ONLY the provided major requirements context. If the answer is not present, say you could not find it in the local data."),
+                    HumanMessage(content=f"Major requirements context:\n{major_context}\n\nQuestion: {user_question}"),
+                ]).content
+                if not _response_indicates_no_answer_found(response):
+                    return response, ["majors_retriever"], {"source": "majors_retriever"}
+        except Exception as e:
+            print(f"⚠️ Could not retrieve major information: {e}")
+
+    if allowed_tools is None or "web_search" in allowed_tools:
+        search_result = _run_shared_search_pipeline(
+            user_id=user_id,
+            question_text=user_question,
+            conversation_history=None,
+            trace=trace,
+            preferred_strategy="generic_authoritative_lookup",
+            preferred_domains=["abington.psu.edu", "psu.edu", "pennstate.edu"],
+            required_domain_mode="preferred",
+        )
+        web_response = _research_answer_text(search_result)
+        if web_response:
+            return web_response, ["web_search"], {
+                "source": "shared_search_pipeline",
+                **_resolved_search_to_metadata(search_result),
+            }
+    return "I couldn't find that major's requirements. Please provide the exact major name.", [], {"source": "major_lookup_not_found"}
+
+
+def _build_general_academic_chat_draft(
+    user_question: str,
+    conversation_history: Optional[List[dict]],
+    student_data: Optional[dict],
+    trace: Optional[Dict[str, Any]],
+    allowed_tools: Optional[set],
+    user_id: str = "default",
+) -> Tuple[str, List[str], Dict[str, Any]]:
+    if not is_academic_or_policy_question(user_question):
+        return (
+            "Sorry, this question is beyond the scope of this conversation. I can only help with academic advising, course planning, Penn State policies, and graduation requirements.",
+            [],
+            {"source": "scope_guard"},
+        )
+
+    if allowed_tools is not None and not allowed_tools:
+        return "", [], {"source": "general_academic_chat_no_tools"}
+
+    student_record = ""
+    major = ""
+    completed_courses = []
+    if student_data:
+        major = student_data.get("major", "") or ""
+        completed_courses = student_data.get("completed_courses", [])
+        student_record = json.dumps(student_data, indent=2)
+
+    conversation_context = ""
+    if conversation_history and len(conversation_history) > 1:
+        recent_history = conversation_history[-6:]
+        conversation_context = "\n\nPrevious conversation:\n"
+        for msg in recent_history:
+            role = "Student" if msg.get('role') == 'user' else "AI Advisor"
+            conversation_context += f"{role}: {msg.get('content', '')}\n"
+
+    system_content = """You are a helpful AI Academic Advisor. You help students with course planning, prerequisites, major requirements, graduation planning, and Penn State academic questions. Use the available context to answer accurately."""
+    system_content += f"\n\n{_get_current_datetime_context()}"
+    if student_record:
+        system_content += f"\n\nStudent Information:\n{student_record}\n"
+        if major:
+            system_content += f"Major: {major}\n"
+        if completed_courses:
+            system_content += f"Completed Courses: {', '.join(completed_courses[:10])}\n"
+
+    gathered_tools: List[str] = []
+    course_context = ""
+    policy_context = ""
+
+    if (allowed_tools is None or "policy_retriever" in allowed_tools) and policy_retriever and is_policy_question(user_question):
+        try:
+            policy_docs = policy_retriever.invoke(user_question)
+            if policy_docs:
+                gathered_tools.append("policy_retriever")
+                policy_context = "\n\nRelevant Advising/Registrar Policy:\n" + "\n\n".join(
+                    doc.page_content[:600] for doc in policy_docs[:3]
+                )
+        except Exception as e:
+            print(f"⚠️ Could not retrieve policy information: {e}")
+
+    try:
+        if (allowed_tools is None or "course_retriever" in allowed_tools) and course_retriever:
+            course_docs = course_retriever.invoke(user_question)
+            if course_docs:
+                gathered_tools.append("course_retriever")
+                course_context += "\n\nRelevant Course Information:\n" + "\n\n".join(
+                    doc.page_content[:500] for doc in course_docs[:2]
+                )
+        if (allowed_tools is None or "majors_retriever" in allowed_tools) and majors_retriever:
+            major_docs = majors_retriever.invoke(user_question)
+            if major_docs:
+                gathered_tools.append("majors_retriever")
+                course_context += "\n\nRelevant Major Requirements:\n" + "\n\n".join(
+                    doc.page_content[:500] for doc in major_docs[:2]
+                )
+        if (allowed_tools is None or "transcript_retriever" in allowed_tools) and pdf_retriever and student_data:
+            transcript_docs = pdf_retriever.invoke(user_question)
+            if transcript_docs:
+                gathered_tools.append("transcript_retriever")
+                course_context += "\n\nRelevant Transcript Information:\n" + "\n\n".join(
+                    doc.page_content[:500] for doc in transcript_docs[:2]
+                )
+    except Exception as e:
+        print(f"⚠️ Could not retrieve academic context: {e}")
+
+    if policy_context:
+        course_context += policy_context
+
+    full_prompt = f"{conversation_context}\n\nCurrent Question: {user_question}"
+    if course_context:
+        full_prompt += course_context
+
+    if (
+        (allowed_tools is None or "web_search" in allowed_tools)
+        and (not course_context or len(course_context.strip()) < 300)
+        and is_academic_or_policy_question(user_question)
+    ):
+        search_result = _run_shared_search_pipeline(
+            user_id=user_id,
+            question_text=user_question,
+            conversation_history=conversation_history,
+            trace=trace,
+            preferred_strategy="generic_authoritative_lookup",
+        )
+        web_context = _research_answer_text(search_result)
+        if web_context:
+            gathered_tools.append("web_search")
+            full_prompt += f"\n\nWeb research notes:\n{web_context}"
+
+    response = llm2.invoke([
+        SystemMessage(content=system_content),
+        HumanMessage(content=full_prompt),
+    ]).content
+
+    if (allowed_tools is None or "web_search" in allowed_tools) and _response_indicates_no_answer_found(response):
+        search_result = _run_shared_search_pipeline(
+            user_id=user_id,
+            question_text=user_question,
+            conversation_history=conversation_history,
+            trace=trace,
+            preferred_strategy="generic_authoritative_lookup",
+        )
+        web_response = _research_answer_text(search_result)
+        if web_response:
+            gathered_tools.append("web_search")
+            return web_response, list(dict.fromkeys(gathered_tools)), {
+                "source": "shared_search_pipeline",
+                **_resolved_search_to_metadata(search_result),
+            }
+
+    return response, list(dict.fromkeys(gathered_tools)), {"source": "general_academic_chat"}
+
+
+def _build_research_lookup_draft(
+    user_id: str,
+    user_question: str,
+    conversation_history: Optional[List[dict]],
+    trace: Optional[Dict[str, Any]],
+    allowed_tools: Optional[set],
+) -> Tuple[str, List[str], Dict[str, Any]]:
+    if allowed_tools is not None and "web_search" not in allowed_tools:
+        return (
+            "I don't have web research enabled for this response.",
+            [],
+            {"source": "research_lookup_disabled"},
+        )
+    search_result = _run_shared_search_pipeline(
+        user_id=user_id,
+        question_text=user_question,
+        conversation_history=conversation_history,
+        trace=trace,
+        preferred_strategy="generic_authoritative_lookup",
+    )
+    answer_text = _research_answer_text(search_result)
+    if answer_text:
+        return answer_text, ["web_search"], {
+            "source": "shared_search_pipeline",
+            **_resolved_search_to_metadata(search_result),
+        }
+    return (
+        "I couldn't verify the answer with enough confidence from the available sources.",
+        ["web_search"],
+        {
+            "source": "shared_search_pipeline",
+            **_resolved_search_to_metadata(search_result),
+        },
+    )
+
+
+def _build_executor_draft(
+    user_id: str,
+    plan: OrchestrationPlan,
+    user_question: str,
+    conversation_history: Optional[List[dict]],
+    has_transcript_for_plan: bool,
+    student_data: Optional[dict],
+    trace: Optional[Dict[str, Any]],
+    retry_reason: Optional[str] = None,
+) -> Tuple[str, List[str], Dict[str, Any]]:
+    allowed_tools = set(plan.allowed_tools or [])
+
+    if plan.executor_path == "conversation_plan_slice":
+        prior_plan = _find_recent_assistant_plan_text(conversation_history)
+        if prior_plan:
+            sliced = _slice_semester_plan_text(prior_plan, max(1, plan.semester_horizon))
+            if sliced:
+                return sliced, [], {"source": "conversation_plan_slice"}
+        return (
+            "I couldn't find a recent semester-by-semester plan in the conversation to narrow down. Please ask for the plan again and then I can trim it to the next semester.",
+            [],
+            {"source": "conversation_plan_slice_missing_context"},
+        )
+
+    if plan.executor_path == "deterministic_plan":
+        return _build_transcript_plan_draft(plan, user_question, conversation_history, has_transcript_for_plan)
+
+    if plan.executor_path == "transcript_audit":
+        return _build_transcript_audit_draft(student_data, user_question), ["transcript_state"] if student_data else [], {"source": "transcript_audit"}
+
+    if plan.executor_path == "conversation_profile_recall":
+        return (
+            _build_conversation_profile_recall_draft(conversation_history, student_data),
+            [],
+            {"source": "conversation_profile_recall"},
+        )
+
+    if plan.executor_path == "course_lookup":
+        response, tools_used, metadata = _build_course_lookup_draft_with_tools(
+            plan.corrected_question or user_question,
+            trace,
+            allowed_tools,
+            user_id=user_id,
+        )
+        return response, tools_used, metadata
+
+    if plan.executor_path == "policy_lookup":
+        response, tools_used, metadata = _build_policy_lookup_draft(
+            plan.corrected_question or user_question,
+            conversation_history,
+            trace,
+            allowed_tools,
+            retry_reason=retry_reason,
+            user_id=user_id,
+        )
+        return response, tools_used, metadata
+
+    if plan.executor_path == "major_lookup":
+        response, tools_used, metadata = _build_major_lookup_draft(
+            plan.corrected_question or user_question,
+            trace,
+            allowed_tools,
+            user_id=user_id,
+        )
+        return response, tools_used, metadata
+
+    if plan.executor_path == "research_lookup":
+        return _build_research_lookup_draft(
+            user_id=user_id,
+            user_question=plan.corrected_question or user_question,
+            conversation_history=conversation_history,
+            trace=trace,
+            allowed_tools=allowed_tools,
+        )
+
+    if not plan.use_tools:
+        return "", [], {"source": "general_academic_chat_no_tools"}
+
+    response, tools_used, metadata = _build_general_academic_chat_draft(
+        plan.corrected_question or user_question,
+        conversation_history,
+        student_data,
+        trace,
+        allowed_tools,
+        user_id=user_id,
+    )
+    return response, tools_used, metadata
+
+
+def _run_executor_stage(
+    plan: OrchestrationPlan,
+    draft_response: str,
+    conversation_history: Optional[List[dict]],
+    supporting_context: str,
+    retry_reason: Optional[str] = None,
+) -> str:
+    recent_messages = []
+    for message in (conversation_history or [])[-4:]:
+        role = str(message.get("role", "user"))
+        content = str(message.get("content", "") or "")
+        recent_messages.append(f"{role}: {content[:250]}")
+
+    system_prompt = (
+        "You are the executor stage for an academic advising assistant. "
+        "Produce the core answer for the user based on the provided execution plan, conversation history, and supporting context. "
+        "Use your own reasoning to answer the question. "
+        "Treat helper outputs and drafts as supporting evidence, not as the only possible answer. "
+        "When no tools are required, answer directly from the conversation history and available context. "
+        "Preserve the requested scope exactly. "
+        "If the draft already contains semester blocks, preserve those blocks and do not add extra semesters."
+    )
+    user_prompt = (
+        f"{_get_current_datetime_context()}\n"
+        f"Original question: {plan.original_question}\n"
+        f"Corrected question: {plan.corrected_question}\n"
+        f"Resolved need: {plan.resolved_user_need}\n"
+        f"Domain: {plan.domain}\n"
+        f"Deliverable: {plan.deliverable}\n"
+        f"Plan scope: {plan.plan_scope}\n"
+        f"Semester horizon: {plan.semester_horizon}\n"
+        f"Must not do: {plan.must_not_do}\n"
+        f"Retry reason: {retry_reason or 'none'}\n"
+        f"Recent conversation:\n" + ("\n".join(recent_messages) if recent_messages else "[none]") + "\n\n"
+        f"Supporting context:\n{supporting_context or '[none]'}\n\n"
+        f"Draft answer:\n{draft_response}"
+    )
+    raw_output = llm2.invoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]).content
+    candidate = str(raw_output or "").strip()
+    if not candidate:
+        return draft_response or "I need a bit more detail to answer that. Please ask a more specific academic advising question."
+
+    draft_blocks = _extract_semester_blocks_from_text(draft_response)
+    candidate_blocks = _extract_semester_blocks_from_text(candidate)
+    if draft_blocks:
+        expected_blocks = 1 if plan.plan_scope == "single_semester" else plan.semester_horizon if plan.plan_scope == "multi_semester" else len(draft_blocks)
+        if plan.plan_scope in {"single_semester", "multi_semester"} and len(candidate_blocks) != expected_blocks:
+            return draft_response
+    return candidate
+
+
+def _execute_orchestration_plan(
+    user_id: str,
+    plan: OrchestrationPlan,
+    user_question: str,
+    conversation_history: Optional[List[dict]],
+    has_transcript_for_plan: bool,
+    student_data: Optional[dict],
+    trace: Optional[Dict[str, Any]],
+    retry_reason: Optional[str] = None,
+) -> ExecutorResult:
+    draft_response, tools_used, metadata = _build_executor_draft(
+        user_id=user_id,
+        plan=plan,
+        user_question=user_question,
+        conversation_history=conversation_history,
+        has_transcript_for_plan=has_transcript_for_plan,
+        student_data=student_data,
+        trace=trace,
+        retry_reason=retry_reason,
+    )
+    supporting_context = _build_reasoning_support_context(
+        plan=plan,
+        conversation_history=conversation_history,
+        student_data=student_data,
+        draft_response=draft_response,
+        metadata=metadata,
+    )
+    final_response = _run_executor_stage(
+        plan=plan,
+        draft_response=draft_response,
+        conversation_history=conversation_history,
+        supporting_context=supporting_context,
+        retry_reason=retry_reason,
+    )
+    return ExecutorResult(
+        response=final_response,
+        tools_used=list(dict.fromkeys(tools_used)),
+        metadata={
+            "draft_preview": draft_response[:500],
+            "supporting_context_preview": supporting_context[:500],
+            "retry_reason": retry_reason,
+            **metadata,
+        },
+    )
+
 def generate_conversational_response(
     user_question,
     conversation_history,
@@ -2989,28 +3935,27 @@ def generate_conversational_response(
     user_has_transcript=None,
     debug_mode: bool = False
 ):
-    """Generate a conversational response using conversation history for context.
-    user_has_transcript: If provided, overrides global has_transcript for plan routing.
-    Use doc_hash != 'no_transcript' from API to avoid using another user's transcript.
-    """
+    """Generate a response through the orchestrator -> executor -> finalizer pipeline."""
     print("\n🔹 Generating Conversational Response...")
 
     global llm1, llm2, llm_classifier, has_transcript, stored_pdf_docs, latest_student_data
-    global course_retriever, majors_retriever, pdf_retriever, policy_retriever
     global execution_trace_store
 
-    # Keep lightweight tracing always on so debugging info is consistently available.
-    trace_enabled = True
+    trace_enabled = _is_debug_enabled(debug_mode)
     trace = _new_execution_trace(user_id=user_id, user_question=user_question, enabled=trace_enabled)
-    _trace_event(trace, "start", "Request received", {"has_history": bool(conversation_history), "history_len": len(conversation_history or [])})
+    _trace_event(
+        trace,
+        "start",
+        "Request received",
+        {"has_history": bool(conversation_history), "history_len": len(conversation_history or [])},
+    )
 
-    # Use per-user transcript status when provided (avoids cross-user contamination)
     if user_has_transcript is not None:
         has_transcript_for_plan = user_has_transcript and (stored_pdf_docs is not None)
     else:
         has_transcript_for_plan = stored_pdf_docs is not None and has_transcript
 
-    if llm1 is None or llm2 is None:
+    if llm1 is None or llm2 is None or llm_classifier is None:
         print("⚠️ LLMs not initialized. Initializing now...")
         try:
             setup_environment(None)
@@ -3021,525 +3966,65 @@ def generate_conversational_response(
                 os.environ['OPENAI_API_KEY'] = "REDACTED"
             if not os.getenv('LANGCHAIN_API_KEY'):
                 os.environ['LANGCHAIN_API_KEY'] = 'REDACTED'
-            llm1 = ChatOpenAI(model_name="gpt-4o", temperature=0)
-            llm2 = ChatOpenAI(model_name="gpt-4o", temperature=0)
-            llm_classifier = ChatOpenAI(model_name="gpt-4o-mini", temperature=0)
+            llm1 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
+            llm2 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
+            llm_classifier = ChatOpenAI(model_name=CLASSIFIER_MODEL_NAME, temperature=0)
 
-    reasoning_plan = _build_reasoning_plan(user_question, conversation_history, has_transcript_for_plan)
-    contextual_question = str(reasoning_plan.get("contextual_question") or user_question)
-    query_type = route_query(contextual_question, has_transcript=has_transcript_for_plan, conversation_history=conversation_history)
-    if reasoning_plan.get("intent") in {"policy", "course", "major", "transcript"}:
-        query_type = reasoning_plan.get("intent")
     student_data = get_student_data_from_transcript()
-    execution_profile = _build_execution_profile(contextual_question, query_type, reasoning_plan)
-    reasoning_plan["execution_profile"] = execution_profile
-    trace["plan"] = {
-        "intent": reasoning_plan.get("intent"),
-        "query_type": query_type,
-        "delivery": reasoning_plan.get("delivery"),
-        "needed_data": reasoning_plan.get("needed_data"),
-        "tools": reasoning_plan.get("tools"),
-        "web_search_mode": reasoning_plan.get("web_search_mode"),
-        "execution_profile": execution_profile,
-        "contextual_question": contextual_question,
+    if not student_data and has_transcript_for_plan and stored_pdf_docs:
+        try:
+            student_data = extract_student_data_deterministic(stored_pdf_docs)
+            latest_student_data = student_data
+        except Exception as e:
+            print(f"⚠️ Failed to extract student data deterministically: {e}")
+            student_data = latest_student_data
+
+    available_tools = _build_available_tool_inventory(has_transcript_for_plan)
+    validation_helpers = {
+        "needs_specific_date": _question_needs_specific_date,
+        "has_concrete_date": _has_concrete_date_in_text,
+        "is_time_sensitive_fact": _is_time_sensitive_factual_question,
+        "extract_source_urls": _extract_source_urls_from_response,
+        "indicates_no_answer": _response_indicates_no_answer_found,
     }
-    _trace_event(trace, "plan", "Built reasoning plan", trace["plan"])
-
-    def finalize_response(text: str) -> str:
-        final_text = _observe_and_repair_response(
-            user_question=user_question,
-            response=text,
-            reasoning_plan=reasoning_plan,
-            query_type=query_type,
-            conversation_history=conversation_history,
-            trace=trace
-        )
-        if trace.get("enabled"):
-            trace["result_preview"] = final_text[:400]
-            trace["finished_at"] = datetime.now().isoformat()
-            execution_trace_store[user_id] = trace
-        return final_text
-
-    # Handle recommendation intent early via reasoning layer (before route-specific handlers).
-    if reasoning_plan.get("intent") == "recommendation":
-        if not student_data and has_transcript_for_plan and stored_pdf_docs:
-            try:
-                student_data = extract_student_data_deterministic(stored_pdf_docs)
-                latest_student_data = student_data
-            except Exception as e:
-                print(f"⚠️ Failed to extract student data for recommendations: {e}")
-                student_data = latest_student_data
-
-        if student_data:
-            completed = set(student_data.get("completed_courses", []))
-            in_progress = set(student_data.get("in_progress_courses", []))
-            all_done = completed.union(in_progress)
-            major_raw = student_data.get("major", "Unknown") or "Unknown"
-            major = normalize_major_name(major_raw) or major_raw
-
-            try:
-                from graduationFlowchart import generate_semester_plan
-                courses_csv = os.path.join(os.path.dirname(__file__), "processed_psu_courses.csv")
-                majors_csv = os.path.join(os.path.dirname(__file__), "all_abington_majors_combined(5).csv")
-                completed_and_ip = list(all_done)
-                plan = generate_semester_plan(
-                    major_name=major or "Unknown",
-                    completed_courses=completed_and_ip,
-                    unmet_requirements=student_data.get("unmet_requirements", []),
-                    courses_csv_path=courses_csv,
-                    majors_csv_path=majors_csv,
-                    credits_needed=student_data.get("credits_needed"),
-                    max_semesters=8,
-                    max_credits_per_sem=15,
-                    min_credits_per_sem=15
-                )
-                if plan.get("semesters"):
-                    horizon = int(reasoning_plan.get("semester_horizon", 1) or 1)
-                    ordered = sorted(plan["semesters"], key=lambda s: s.get("semester", 0))
-                    selected = ordered[:max(1, min(8, horizon))]
-                    lines = [f"Here are recommended courses for your next {len(selected)} semester(s) (based on your transcript and major {major}):"]
-                    for idx, sem in enumerate(selected, start=1):
-                        lines.append(f"\nSemester +{idx}:")
-                        for c in sem.get("courses", [])[:8]:
-                            lines.append(f"- {_format_course_for_display(c)}")
-                        lines.append(f"Total Credits: {sem.get('credits', 0)}")
-                    lines.append("\nIf you want, I can also generate your full semester-by-semester graduation plan.")
-                    return finalize_response("\n".join(lines))
-            except Exception as e:
-                print(f"⚠️ Could not build next-semester recommendation: {e}")
-
-        return finalize_response("I need your transcript to recommend next-semester courses. Please upload it first, then ask again.")
-
-    # Universal pre-execution verification stage (applies to all query types by profile).
-    if execution_profile.get("require_web_precheck"):
-        mode = execution_profile.get("verification_mode")
-        if mode == "date" and query_type in {"policy", "chat"}:
-            web_response = _web_search_and_synthesize(
-                contextual_question,
-                date_only=True,
-                conversation_history=conversation_history,
-                prefer_current_or_future=bool(execution_profile.get("prefer_current_or_future")),
-                trace=trace
-            )
-            if web_response and web_response != "DATE_NOT_FOUND":
-                return finalize_response(_format_deadline_answer(web_response, contextual_question, conversation_history))
-        elif mode == "fresh_fact":
-            web_response = _web_search_and_synthesize(
-                contextual_question,
-                conversation_history=conversation_history,
-                trace=trace,
-                force_fresh_identity=bool(execution_profile.get("identity_like"))
-            )
-            if web_response:
-                return finalize_response(web_response)
-
-    # Quick course prerequisite path
-    if query_type == 'course':
-        expanded_course_question = _expand_academic_query_terms(user_question)
-        course_match = re.search(r'\b([A-Z]{2,})\s+(\d{3}[A-Z]?)\b', user_question, re.IGNORECASE)
-        if course_match:
-            course_code = f"{course_match.group(1).upper()} {course_match.group(2)}"
-            try:
-                try:
-                    from graphExperiment import course_graph as cg
-                    if cg:
-                        prereq_text = get_course_prerequisites(course_code, cg)
-                        return finalize_response(prereq_text)
-                except ImportError:
-                    pass
-            except Exception as e:
-                print(f"⚠️ Could not fetch prerequisites: {e}")
-        course_info = process_psu_courses(expanded_course_question)
-        if course_info and "No relevant courses found" not in course_info:
-            return finalize_response(course_info)
-        # Course not in our data - try web search for Penn State course info
-        if is_academic_or_policy_question(user_question):
-            web_response = _web_search_and_synthesize(expanded_course_question, trace=trace)
-            if web_response:
-                return finalize_response(web_response)
-        return finalize_response("I couldn't find that course. Please check the code (e.g., 'CMPSC 131').")
-
-    # Policy questions directly answered from the policy PDF
-    if query_type == 'policy':
-        response = None
-        if policy_retriever:
-            try:
-                policy_docs = policy_retriever.invoke(contextual_question)
-                if policy_docs:
-                    policy_context = "\n\n".join(doc.page_content[:900] for doc in policy_docs[:4])
-                    response = llm2.invoke([
-                        SystemMessage(content="Answer the student's question using ONLY the provided policy text. If the answer isn't present, say you couldn't find it in the policy."),
-                        HumanMessage(content=f"Policy context:\n{policy_context}\n\nQuestion: {contextual_question}")
-                    ]).content
-                    # Universal execution profile: enforce date verification when required.
-                    if execution_profile.get("verification_mode") == "date":
-                        # If policy text doesn't provide a concrete date, verify via web immediately.
-                        if not _has_concrete_date_in_text(response):
-                            web_response = _web_search_and_synthesize(
-                                contextual_question,
-                                date_only=True,
-                                conversation_history=conversation_history,
-                                prefer_current_or_future=True,
-                                trace=trace
-                            )
-                            if web_response and web_response != "DATE_NOT_FOUND":
-                                return finalize_response(_format_deadline_answer(web_response, contextual_question, conversation_history))
-                            if _term_or_year_was_provided(contextual_question, conversation_history):
-                                term, year = _infer_term_year_from_context(contextual_question, conversation_history)
-                                target_label = f"{(term or 'the requested term').title()} {year}".strip()
-                                return finalize_response(
-                                    f"I couldn't verify an exact late-drop date for {target_label} from the available sources. "
-                                    "Please specify campus/session type (e.g., Abington regular session or 7-week) so I can narrow it down."
-                                )
-                            return finalize_response("I need the specific term/session (e.g., Spring 2026, Fall 2026, or Summer) to return the exact late-drop date.")
-                        # Local policy answer already includes a concrete date; return only the date(s).
-                        local_dates = _extract_dates_from_text(response)
-                        if local_dates:
-                            return finalize_response(_format_deadline_answer(local_dates[0], contextual_question, conversation_history))
-                        return finalize_response("I need the specific term/session (e.g., Spring 2026, Fall 2026, or Summer) to return the exact late-drop date.")
-                    if not _response_indicates_no_answer_found(response):
-                        return finalize_response(response)
-                    # Answer not in our data - try web search
-                    print("🔍 Policy answer not found in local data, trying web search...")
-                    web_response = _web_search_and_synthesize(contextual_question, conversation_history=conversation_history, trace=trace)
-                    if web_response:
-                        return finalize_response(web_response)
-            except Exception as e:
-                print(f"⚠️ Could not retrieve policy information: {e}")
-        # No policy docs or web search failed - try web search as fallback
-        if response is None or _response_indicates_no_answer_found(response):
-            web_response = _web_search_and_synthesize(contextual_question, conversation_history=conversation_history, trace=trace)
-            if web_response:
-                return finalize_response(web_response)
-        return finalize_response("I couldn't find that policy information. Please rephrase your question or check the Penn State website directly.")
-
-    # Transcript-based planning or transcript Q&A
-    if query_type == 'transcript':
-        plan_keywords = ['graduation plan', 'generate plan', 'create plan', 'semester plan', 'course plan', 'plan', 'schedule', 'next semester']
-        wants_plan = any(k in user_question.lower() for k in plan_keywords)
-
-        if wants_plan:
-            # FIRST: If user explicitly states major and year in their question, use that
-            # (avoids wrong major from another user's transcript / global state)
-            major_from_text, year_from_text = None, None
-            try:
-                major_from_text, year_from_text = extract_major_and_year_from_text(user_question, conversation_history)
-                if not major_from_text or not year_from_text:
-                    major_from_text, year_from_text = simple_extract_major_and_year(user_question)
-                if not year_from_text:
-                    year_from_text = _fuzzy_year_from_text(user_question)
-            except Exception as e:
-                print(f"⚠️ Error extracting major/year from text: {e}")
-
-            if major_from_text and year_from_text:
-                print(f"📋 Using explicit major/year from question: {major_from_text}, {year_from_text}")
-                return finalize_response(generate_plan_from_major_and_year(major_from_text, year_from_text))
-
-            # SECOND: Use transcript only if THIS user has one
-            if has_transcript_for_plan:
-                print("📋 Detected plan request with transcript, using deterministic pipeline...")
-                return finalize_response(aggregate_and_generate_response(user_question))
-
-            # No explicit major/year and no transcript
-            return finalize_response("I need your major and year (e.g., 'Computer Science freshman' or 'Business, B.S. freshman') or a transcript upload to build a plan.")
-
-        if student_data:
-            credits_needed = student_data.get("credits_needed", "unknown")
-            credits_completed = student_data.get("credits_completed", "unknown")
-            unmet = student_data.get("unmet_requirements", [])
-            # If deterministic unmet data is too generic, enrich from full transcript text parser.
-            if unmet and all(
-                isinstance(x, dict) and x.get("category", "").strip().lower() in {"", "requirement"}
-                for x in unmet
-            ) and stored_pdf_docs:
-                try:
-                    parsed_unmet = extract_not_satisfied_sections(stored_pdf_docs)
-                    if parsed_unmet:
-                        unmet = parsed_unmet
-                except Exception as e:
-                    print(f"⚠️ Could not enrich unmet requirement details: {e}")
-
-            def _format_unmet_item(item) -> str:
-                if isinstance(item, dict):
-                    category = str(item.get("category", "Requirement")).strip() or "Requirement"
-                    needed = item.get("needed", 0)
-                    used = item.get("used", None)
-                    required = item.get("required", None)
-                    if required is not None and used is not None:
-                        return f"- {category}: {needed} credits needed ({used}/{required} completed)"
-                    return f"- {category}: {needed} credits needed"
-                if isinstance(item, (list, tuple)):
-                    return f"- Requirement: {', '.join(str(x) for x in item)}"
-                return f"- Requirement: {str(item)}"
-
-            unmet_summary = "\n".join(
-                _format_unmet_item(item) for item in unmet[:8]
-            ) if unmet else "No unmet requirements found."
-
-            # Audit-focused wording when user asks to "audit/review/check" transcript.
-            audit_terms = ["audit", "review", "check", "analyze", "analyse", "evaluate", "where do i stand"]
-            is_audit_request = any(t in user_question.lower() for t in audit_terms)
-
-            if is_audit_request or reasoning_plan.get("intent") == "audit":
-                return finalize_response(
-                    f"Academic Audit Summary\n"
-                    f"- Major: {student_data.get('major', 'Unknown')}\n"
-                    f"- Credits completed: {credits_completed}\n"
-                    f"- Credits remaining: {credits_needed}\n"
-                    f"- In-progress courses: {', '.join(student_data.get('in_progress_courses', [])[:8]) if student_data.get('in_progress_courses') else 'None'}\n"
-                    f"- Recently completed courses: {', '.join(student_data.get('completed_courses', [])[-8:]) if student_data.get('completed_courses') else 'Not detected'}\n"
-                    f"- Key unmet requirements:\n{unmet_summary}\n\n"
-                    f"Next step: ask \"recommend me courses for next 2 semesters\" for concrete near-term scheduling, "
-                    f"or \"give me a full graduation plan\" for the full 8-semester path."
-                )
-
-            return finalize_response(
-                f"From your transcript:\n"
-                f"- Major: {student_data.get('major', 'Unknown')}\n"
-                f"- Credits completed: {credits_completed}\n"
-                f"- Credits remaining: {credits_needed}\n"
-                f"- Top unmet requirements:\n{unmet_summary}\n"
-                f"If you want a detailed plan, ask me to generate a graduation plan."
-            )
-        return finalize_response("I couldn't read a transcript. Please upload one so I can answer transcript-specific questions.")
-
-    # Major requirements lookups
-    if query_type == 'major':
-        major_info = process_psu_courses(user_question)
-        if major_info and "No relevant courses found" not in major_info:
-            return finalize_response(major_info)
-        # Major not in our data - try web search for Penn State major requirements
-        if is_academic_or_policy_question(user_question):
-            web_response = _web_search_and_synthesize(user_question, trace=trace)
-            if web_response:
-                return finalize_response(web_response)
-        return finalize_response("I couldn't find that major's requirements. Please provide the exact major name.")
-
-    # Otherwise, use conversational approach with context or short recommendations
-    # Scope restriction: non-academic questions get scope message
-    if not is_academic_or_policy_question(user_question):
-        return finalize_response("Sorry, this question is beyond the scope of this conversation. I can only help with academic advising, course planning, Penn State policies, and graduation requirements.")
 
     try:
-        if reasoning_plan.get("intent") != "recommendation" and any(
-            k in user_question.lower() for k in ['next semester', 'upcoming semester', 'what should i take next', 'recommend courses', 'recommend me courses']
-        ):
-            if not student_data:
-                if stored_pdf_docs:
-                    try:
-                        student_data = extract_student_data_deterministic(stored_pdf_docs)
-                        latest_student_data = student_data
-                    except Exception as e:
-                        print(f"⚠️ Failed to extract student data: {e}")
-                        student_data = latest_student_data
-                else:
-                    student_data = latest_student_data
-
-            if student_data:
-                completed = set(student_data.get("completed_courses", []))
-                in_progress = set(student_data.get("in_progress_courses", []))
-                all_done = completed.union(in_progress)
-                major_raw = student_data.get("major", "Unknown") or "Unknown"
-                major = normalize_major_name(major_raw) or major_raw
-
-                remaining_courses = []
-                try:
-                    major_course_codes = get_major_course_codes(major) or []
-                    if not major_course_codes:
-                        majors_csv = os.path.join(os.path.dirname(__file__), "all_abington_majors_combined(5).csv")
-                        if os.path.exists(majors_csv):
-                            dfm = pd.read_csv(majors_csv)
-                            candidates = dfm[dfm['Major Name'].str.contains(major, case=False, na=False)]
-                            if not candidates.empty:
-                                try:
-                                    major_course_codes = get_major_course_codes(candidates.iloc[0]['Major Name']) or []
-                                except Exception:
-                                    major_course_codes = []
-                    for c in major_course_codes:
-                        if c not in all_done:
-                            remaining_courses.append(c)
-                    try:
-                        from graduationFlowchart import GraduationFlowchart
-                        majors_csv = os.path.join(os.path.dirname(__file__), "all_abington_majors_combined(5).csv")
-                        if os.path.exists(majors_csv):
-                            flowchart = GraduationFlowchart(
-                                os.path.join(os.path.dirname(__file__), "processed_psu_courses.csv"),
-                                majors_csv
-                            )
-                            row = flowchart._get_major_row(major)
-                            if row is not None:
-                                from graduationFlowchart import extract_all_courses, resolve_common_or_groups
-                                prescribed = resolve_common_or_groups(extract_all_courses(str(row.get("Prescribed Courses", "") or "")))
-                                for c in prescribed:
-                                    if c not in all_done:
-                                        remaining_courses.append(c)
-                    except Exception as e2:
-                        print(f"⚠️ Fallback also failed: {e2}")
-                except Exception as e:
-                    print(f"⚠️ Could not load major course codes: {e}")
-
-                remaining_courses = sorted(set(remaining_courses), key=_course_level_num)
-                suggested = remaining_courses[:5] if remaining_courses else []
-                if not suggested:
-                    try:
-                        from graduationFlowchart import generate_semester_plan
-                        courses_csv = os.path.join(os.path.dirname(__file__), "processed_psu_courses.csv")
-                        majors_csv = os.path.join(os.path.dirname(__file__), "all_abington_majors_combined(5).csv")
-                        completed_and_ip = list(all_done)
-                        plan = generate_semester_plan(
-                            major_name=major or "Unknown",
-                            completed_courses=completed_and_ip,
-                            unmet_requirements=student_data.get("unmet_requirements", []),
-                            courses_csv_path=courses_csv,
-                            majors_csv_path=majors_csv,
-                            credits_needed=student_data.get("credits_needed")
-                        )
-                        if plan.get("semesters"):
-                            next_sem = sorted(plan["semesters"], key=lambda s: s.get("semester", 0))[0]
-                            suggested = next_sem.get("courses", [])[:5]
-                    except Exception as e:
-                        print(f"⚠️ Could not build next-semester suggestion from plan: {e}")
-
-                if suggested:
-                    return finalize_response(
-                        f"Here are recommended courses for your next semester (based on your transcript and major {major}):\n"
-                        + "\n".join([f"- {_format_course_for_display(c)}" for c in suggested])
-                        + "\nIf you'd like a full graduation plan, ask me to generate one."
-                    )
-                return finalize_response("I couldn't confidently pick next-semester courses from your record. Please ask me to generate a full graduation plan.")
-
-            if has_transcript and stored_pdf_docs:
-                return finalize_response("I'm processing your transcript. Please try asking again in a moment, or ask me to generate a full graduation plan.")
-            return finalize_response("I need your transcript to recommend next-semester courses. Please upload it or tell me your major/year.")
-
-        student_record = ""
-        major = ""
-        completed_courses = []
-        try:
-            if student_data:
-                major = student_data.get("major", "") or ""
-                completed_courses = student_data.get("completed_courses", [])
-                student_record = json.dumps(student_data, indent=2)
-        except Exception as e:
-            print(f"⚠️ Could not retrieve student record: {e}")
-        
-        conversation_context = ""
-        if conversation_history and len(conversation_history) > 1:
-            recent_history = conversation_history[-6:]
-            conversation_context = "\n\nPrevious conversation:\n"
-            for msg in recent_history:
-                role = "Student" if msg.get('role') == 'user' else "AI Advisor"
-                conversation_context += f"{role}: {msg.get('content', '')}\n"
-        
-        system_content = """You are a friendly and helpful AI Academic Advisor. You help students with:
-- Course planning and scheduling
-- Prerequisite questions
-- Major requirements
-- Graduation planning
-- General academic advice
-
-Be conversational, helpful, and empathetic. Use the conversation history to maintain context and provide personalized advice. If the student asks about their graduation plan, you can generate one. If they ask general questions, answer them naturally using the available course and student information."""
-        
-        if student_record:
-            system_content += f"\n\nStudent Information:\n{student_record}\n"
-            if major:
-                system_content += f"Major: {major}\n"
-            if completed_courses:
-                system_content += f"Completed Courses: {', '.join(completed_courses[:10])}\n"
-        
-        course_context = ""
-        policy_context = ""
-        if policy_retriever and is_policy_question(user_question):
-            try:
-                policy_docs = policy_retriever.invoke(user_question)
-                if policy_docs:
-                    policy_context = "\n\nRelevant Advising/Registrar Policy:\n" + "\n\n".join(
-                        doc.page_content[:600] for doc in policy_docs[:3]
-                    )
-            except Exception as e:
-                print(f"⚠️ Could not retrieve policy information: {e}")
-
-        try:
-            if query_type == 'course':
-                if course_retriever:
-                    relevant_docs = course_retriever.invoke(user_question)
-                    if relevant_docs:
-                            course_context = "\n\nRelevant Course Information:\n" + "\n\n".join(
-                            doc.page_content[:500] for doc in relevant_docs[:3]
-                        )
-            elif query_type == 'major':
-                if majors_retriever:
-                    relevant_docs = majors_retriever.invoke(user_question)
-                    if relevant_docs:
-                        course_context = "\n\nRelevant Major Requirements:\n" + "\n\n".join(
-                            doc.page_content[:500] for doc in relevant_docs[:3]
-                            )
-            elif query_type == 'transcript':
-                if pdf_retriever:
-                    relevant_docs = pdf_retriever.invoke(user_question)
-                    if relevant_docs:
-                        course_context = "\n\nRelevant Transcript Information:\n" + "\n\n".join(
-                            doc.page_content[:500] for doc in relevant_docs[:3]
-                        )
-            else:
-                if course_retriever:
-                    course_docs = course_retriever.invoke(user_question)
-                    if course_docs:
-                        course_context += "\n\nRelevant Course Information:\n" + "\n\n".join(
-                            doc.page_content[:500] for doc in course_docs[:2]
-                        )
-                if majors_retriever:
-                    major_docs = majors_retriever.invoke(user_question)
-                    if major_docs:
-                        course_context += "\n\nRelevant Major Requirements:\n" + "\n\n".join(
-                            doc.page_content[:500] for doc in major_docs[:2]
-                        )
-            if policy_context:
-                course_context += policy_context
-        except Exception as e:
-            print(f"⚠️ Could not retrieve course information: {e}")
-        
-        full_prompt = f"{conversation_context}\n\nCurrent Question: {user_question}"
-        if course_context:
-            full_prompt += course_context
-
-        # If we have little/no context from our data, add web search for academic/policy questions
-        if (not course_context or len(course_context.strip()) < 300) and is_academic_or_policy_question(user_question):
-            try:
-                from duckduckgo_search import DDGS
-                search_query = f"Penn State {user_question}" if "penn state" not in user_question.lower() and "psu" not in user_question.lower() else user_question
-                _trace_tool(trace, "duckduckgo_search", "augment llm prompt context")
-                with DDGS() as ddgs:
-                    results = list(ddgs.text(search_query, max_results=4))
-                _trace_event(trace, "execute", "Web context query executed", {"query": search_query, "results": len(results)})
-                if results:
-                    web_context = "\n\n".join(
-                        f"[{i+1}] {r.get('title', '')}\n{r.get('body', '')}"
-                        for i, r in enumerate(results[:4])
-                    )
-                    full_prompt += f"\n\nWeb search results (use if our data doesn't have the answer):\n{web_context}"
-            except Exception as e:
-                print(f"⚠️ Web search for context failed: {e}")
-                _trace_tool(trace, "duckduckgo_search", "augment llm prompt context", status="failed", metadata={"error": str(e)})
-
-        response = llm2.invoke([
-            SystemMessage(content=system_content),
-            HumanMessage(content=full_prompt)
-        ]).content
-
-        # If response indicates we couldn't find the answer, try dedicated web search
-        if _response_indicates_no_answer_found(response):
-            web_response = _web_search_and_synthesize(user_question, trace=trace)
-            if web_response:
-                return finalize_response(web_response)
-
-        return finalize_response(response)
-        
+        final_response, plan = run_three_stage_pipeline(
+            user_question=user_question,
+            conversation_history=conversation_history,
+            has_transcript=has_transcript_for_plan,
+            available_tools=available_tools,
+            orchestrator_llm=llm_classifier,
+            finalizer_llm=llm1,
+            execute_plan=lambda orchestration_plan, retry_reason=None: _execute_orchestration_plan(
+                user_id=user_id,
+                plan=orchestration_plan,
+                user_question=user_question,
+                conversation_history=conversation_history,
+                has_transcript_for_plan=has_transcript_for_plan,
+                student_data=student_data,
+                trace=trace,
+                retry_reason=retry_reason,
+            ),
+            trace=trace,
+            trace_event=_trace_event,
+            trace_quality_check=_trace_quality_check,
+            validation_helpers=validation_helpers,
+        )
+        trace["plan"] = plan.to_dict()
+        trace["result_preview"] = final_response[:400]
+        trace["finished_at"] = datetime.now().isoformat()
+        execution_trace_store[user_id] = trace
+        return final_response
     except Exception as e:
         import traceback
-        print(f"Error in conversational response: {e}")
+        print(f"Error in conversational response pipeline: {e}")
         print(f"Traceback: {traceback.format_exc()}")
-        return finalize_response("I apologize, but I encountered an error processing your question. Please try rephrasing it or ask me to generate a graduation plan if you haven't already uploaded your transcript.")
+        fallback = "I apologize, but I encountered an error processing your question. Please try rephrasing it or ask a more specific academic advising question."
+        trace["result_preview"] = fallback[:400]
+        trace["finished_at"] = datetime.now().isoformat()
+        execution_trace_store[user_id] = trace
+        return fallback
 
 
 # =========================
@@ -3566,8 +4051,8 @@ def generate_plan_from_major_and_year(major, year_level, target_grad_in_years=4)
                 os.environ['OPENAI_API_KEY'] = "REDACTED"
             if not os.getenv('LANGCHAIN_API_KEY'):
                 os.environ['LANGCHAIN_API_KEY'] = 'REDACTED'
-            llm1 = ChatOpenAI(model_name="gpt-4o", temperature=0)
-            llm2 = ChatOpenAI(model_name="gpt-4o", temperature=0)
+            llm1 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
+            llm2 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
     
     # Ensure course_graph is available
     if 'course_graph' not in globals() or course_graph is None:

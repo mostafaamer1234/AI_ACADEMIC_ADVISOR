@@ -4,7 +4,15 @@ import re
 import sys
 import os
 import matplotlib.pyplot as plt
-from networkx.drawing.nx_agraph import graphviz_layout
+
+# Use built-in layout (no pygraphviz/graphviz system dependency required)
+def _get_graph_layout(G):
+    """Get node positions for drawing. Uses spring_layout (no external deps)."""
+    try:
+        from networkx.drawing.nx_agraph import graphviz_layout
+        return graphviz_layout(G, prog="dot")
+    except ImportError:
+        return nx.spring_layout(G, k=2, iterations=50)
 
 # Robust text cleaning function
 def clean_text(text):
@@ -182,7 +190,7 @@ def get_course_prerequisites(course_code, G):
 # Visualize the course graph clearly
 def visualize_graph(G):
     plt.figure(figsize=(16, 12))
-    pos = graphviz_layout(G, prog="dot")
+    pos = _get_graph_layout(G)
 
     node_shapes = {node: ("d" if "OR_" in node else "o") for node in G.nodes()}
     node_colors = ["lightgreen" if shape == "d" else "lightblue" for shape in node_shapes.values()]
@@ -271,7 +279,7 @@ for root in sorted(roots):
 
 def visualize_graph(G):
     plt.figure(figsize=(14, 10))
-    pos = graphviz_layout(G, prog="dot")
+    pos = _get_graph_layout(G)
 
     # Define node colors and shapes
     node_colors = ["lightgreen" if "OR_" in node else "lightblue" for node in G.nodes()]

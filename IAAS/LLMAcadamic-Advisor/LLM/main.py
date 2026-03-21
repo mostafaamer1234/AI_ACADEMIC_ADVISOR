@@ -8,6 +8,8 @@ from langchain_core.messages import SystemMessage, HumanMessage
 import pandas as pd
 from werkzeug.utils import secure_filename  # Import for handling file names
 
+PRIMARY_MODEL_NAME = os.getenv("ADVISOR_MODEL_NAME", "gpt-5.4-mini")
+
 
 def setup_environment(whatIfUpload):
     global pdf_retriever, courses_retriever, llm1, llm2
@@ -29,8 +31,8 @@ def setup_environment(whatIfUpload):
     transcript_file.save(temp_pdf_path)
 
     #  LLM Instances
-    llm1 = ChatOpenAI(model_name="gpt-4o", temperature=0)
-    llm2 = ChatOpenAI(model_name="gpt-4o", temperature=0)
+    llm1 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
+    llm2 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
 
     #  PDF (WhatIfReport) Processing
     loader = PyPDFLoader(temp_pdf_path)

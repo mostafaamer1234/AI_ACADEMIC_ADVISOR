@@ -26,12 +26,16 @@ numpy==1.24.3
 networkx==3.2.1
 matplotlib==3.8.2
 
-# Graph Layout (for networkx drawing)
-pygraphviz==1.11
-
 # Fuzzy String Matching
 fuzzywuzzy==0.18.0
 python-levenshtein==0.23.0
 
 # HTTP Requests
 requests==2.31.0
+
+# Web Search (for policy/academic fallback)
+duckduckgo-search>=4.0.0
+
+# Optional web research upgrades
+tavily-python>=0.5.0
+playwright>=1.52.0

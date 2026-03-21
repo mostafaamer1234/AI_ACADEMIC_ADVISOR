@@ -1,5 +1,5 @@
 const express = require('express');
-const mysql = require('mysql');
+const mysql = require('mysql2');
 const bcrypt = require('bcrypt');
 const { exec } = require('child_process');
 const saltRounds = 10;
@@ -51,8 +51,8 @@ if (disableDb) {
     const connectDb = () => {
         connection = mysql.createConnection(dbConfig);
 
-        connection.connect((err) => {
-            if (err) {
+connection.connect((err) => {
+    if (err) {
                 dbAvailable = false;
                 const isConnRefused = err.code === 'ECONNREFUSED';
                 if (isConnRefused) {
@@ -61,16 +61,22 @@ if (disableDb) {
                             return connectDb();
                         }
                         console.warn('⚠️ Database unavailable. Start MySQL or set MYSQL_DISABLE=true.');
-                        console.warn(`   ${err.code || 'MYSQL_ERROR'} ${err.address || ''}:${err.port || ''}`);
+                        console.warn(`   ${err.code || 'MYSQL_ERROR'} ${err.message || err.sqlMessage || ''}`);
+                        if (err.address || err.port) {
+                            console.warn(`   ${err.address || ''}:${err.port || ''}`);
+                        }
                     });
                 }
                 console.warn('⚠️ Database unavailable. Start MySQL or set MYSQL_DISABLE=true.');
-                console.warn(`   ${err.code || 'MYSQL_ERROR'} ${err.address || ''}:${err.port || ''}`);
-                return;
-            }
+                console.warn(`   ${err.code || 'MYSQL_ERROR'} ${err.message || err.sqlMessage || ''}`);
+                if (err.address || err.port) {
+                    console.warn(`   ${err.address || ''}:${err.port || ''}`);
+                }
+        return;
+    }
             dbAvailable = true;
-            console.log('Connected to database');
-        });
+    console.log('Connected to database');
+});
 
         connection.on('error', (err) => {
             dbAvailable = false;

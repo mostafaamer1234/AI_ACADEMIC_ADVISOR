@@ -14,6 +14,12 @@ export const getLlmBaseUrl = () => {
 
 export const generateResponse = async (userQuestion, conversationHistory = [], userId = 'default') => {
     try {
+        const runtimeDebug =
+            typeof window !== 'undefined'
+                ? String(window.localStorage.getItem('debug_trace') || '').toLowerCase() === 'true'
+                : false;
+        const debugTraceEnabled =
+            String(process.env.REACT_APP_DEBUG_TRACE || '').toLowerCase() === 'true' || runtimeDebug;
         const response = await fetch(`${getLlmBaseUrl()}/generate-response`, {
             method: 'POST',
             headers: {
@@ -22,7 +28,8 @@ export const generateResponse = async (userQuestion, conversationHistory = [], u
             body: JSON.stringify({ 
                 user_question: userQuestion,
                 conversation_history: conversationHistory,
-                user_id: userId
+                user_id: userId,
+                debug_trace: debugTraceEnabled
             }),
         });
 
@@ -32,6 +39,9 @@ export const generateResponse = async (userQuestion, conversationHistory = [], u
 
         const data = await response.json();
         console.log("Response from LLM:", data);
+        if (debugTraceEnabled && data.debug_trace) {
+            console.log("Execution trace:", data.debug_trace);
+        }
         return {
             response: data.graduation_plan || data.response || '',
             conversationHistory: data.conversation_history || conversationHistory

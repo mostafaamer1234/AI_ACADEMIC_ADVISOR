@@ -226,7 +226,6 @@ const UnifiedChat = () => {
 
             {messages.length === 0 && (
                 <div className="welcome-message">
-                    <h3>Welcome! 👋</h3>
                     <p>I'm your AI Academic Advisor. Feel free to ask me anything about:</p>
                     <ul>
                         <li>Course information and prerequisites</li>
@@ -235,7 +234,7 @@ const UnifiedChat = () => {
                         <li>Graduation planning (better with transcript)</li>
                         <li>Course recommendations</li>
                     </ul>
-                    <p style={{ marginTop: '15px', fontStyle: 'italic', color: '#666' }}>
+                    <p className="welcome-tip">
                         💡 Tip: Upload your transcript for personalized graduation planning and course recommendations based on your academic history.
                     </p>
                 </div>

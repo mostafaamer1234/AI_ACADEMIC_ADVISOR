@@ -19,6 +19,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from LLM.main_copy import setup_environment
 from LLM.main_copy import aggregate_and_generate_response
 from LLM.main_copy import generate_conversational_response
+from LLM.main_copy import get_execution_trace_for_user
+from LLM.main_copy import clear_search_context_for_user
 from LLM.majorsGraph import MajorGraph
 
 # Import Flask modules
@@ -33,15 +35,19 @@ conversation_storage = {}
 user_transcript_hash = {}
 
 
-def get_cache_key(user_id: str, doc_hash: str, user_question: str, 
-                  model_version: str, prompt_version: str) -> str:
+def get_cache_key(user_id: str, doc_hash: str, user_question: str,
+                  model_version: str, prompt_version: str,
+                  conversation_tail=None) -> str:
     """Generate cache key with all required scoping."""
     import hashlib
     import json
+    if conversation_tail is None:
+        conversation_tail = []
     key_data = {
         "user_id": user_id,
         "doc_hash": doc_hash,
         "question": user_question,
+        "conversation_tail": conversation_tail,
         "model": model_version,
         "prompt": prompt_version
     }
@@ -63,6 +69,23 @@ def compute_file_hash(file_path: str) -> str:
 RESPONSE_CACHE = {}  # In production: Redis
 CACHE_TTL_HOURS = 24
 
+
+def _is_debug_trace_enabled(debug_trace_flag) -> bool:
+    if isinstance(debug_trace_flag, str):
+        debug_trace_flag = debug_trace_flag.strip().lower() in {'1', 'true', 'yes', 'on'}
+    env_flag = str(os.getenv("AGENT_DEBUG_TRACE", "0")).strip().lower() in {'1', 'true', 'yes', 'on'}
+    return bool(debug_trace_flag) or env_flag
+
+
+def _is_dynamic_deadline_query(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    return (
+        ("deadline" in t or "date" in t)
+        and any(k in t for k in ["late drop", "drop", "withdraw", "registration", "current semester", "this semester", "next semester", "upcoming semester"])
+    )
+
 @app.route('/llm/generate-response', methods=['POST'])
 def generate_graduation_plan():
     try:
@@ -70,18 +93,29 @@ def generate_graduation_plan():
         user_question = data.get('user_question', '')
         conversation_history = data.get('conversation_history', [])
         user_id = data.get('user_id', 'default')  # Use session_id or user_id from frontend
+        debug_trace = _is_debug_trace_enabled(data.get('debug_trace', False))
         
         if not user_question:
             return jsonify({"error": "User question is required"}), 400
 
         # Get doc_hash if transcript exists
         doc_hash = get_user_transcript_hash(user_id)
-        model_version = "gpt-4o"  # Or get from config
+        model_version = os.getenv("ADVISOR_MODEL_NAME", "gpt-5.4-mini")
         prompt_version = "v1"  # Or get from config
         
-        # Check cache only when a transcript hash exists; otherwise skip to avoid stale plans
-        cache_key = get_cache_key(user_id, doc_hash, user_question, model_version, prompt_version)
-        if doc_hash != "no_transcript" and cache_key in RESPONSE_CACHE:
+        # Response cache is intentionally disabled so every query executes full
+        # reasoning/planning/tool-use/validation with fresh context.
+        history_tail_for_cache = conversation_history[-6:] if conversation_history else conversation_storage.get(user_id, [])[-6:]
+        cache_key = get_cache_key(
+            user_id,
+            doc_hash,
+            user_question,
+            model_version,
+            prompt_version,
+            conversation_tail=history_tail_for_cache
+        )
+        skip_cache = True
+        if (not skip_cache) and doc_hash != "no_transcript" and cache_key in RESPONSE_CACHE:
             cached = RESPONSE_CACHE[cache_key]
             from datetime import datetime, timedelta
             if datetime.now() - cached['timestamp'] < timedelta(hours=CACHE_TTL_HOURS):
@@ -94,7 +128,8 @@ def generate_graduation_plan():
                 return jsonify({
                     "graduation_plan": cached['response'],
                     "conversation_history": conversation_storage[user_id],
-                    "cached": True
+                    "cached": True,
+                    "debug_trace": get_execution_trace_for_user(user_id)
                 }), 200
 
         # Get existing conversation history for this user
@@ -107,13 +142,18 @@ def generate_graduation_plan():
             conversation_storage[user_id] = conversation_history
         
         # Generate response with existing conversation history (before adding current message)
+        # Pass user's transcript status so we don't use another user's transcript
+        user_has_transcript = (doc_hash != "no_transcript")
         result = generate_conversational_response(
-            user_question, 
-            conversation_storage[user_id]
+            user_question,
+            conversation_storage[user_id],
+            user_id=user_id,
+            user_has_transcript=user_has_transcript,
+            debug_mode=debug_trace
         )
         
-        # Cache response (only if transcript hash exists)
-        if doc_hash != "no_transcript":
+        # Response cache disabled by design (see skip_cache=True above).
+        if (not skip_cache) and doc_hash != "no_transcript":
             from datetime import datetime
             RESPONSE_CACHE[cache_key] = {
                 "response": result,
@@ -137,7 +177,8 @@ def generate_graduation_plan():
         return jsonify({
             "graduation_plan": result,
             "conversation_history": conversation_storage[user_id],
-            "cached": False
+            "cached": False,
+            "debug_trace": get_execution_trace_for_user(user_id)
         }), 200
     except Exception as e:
         logger.error(f"Error generating response: {str(e)}")
@@ -155,7 +196,8 @@ def clear_conversation():
         
         if user_id in conversation_storage:
             conversation_storage[user_id] = []
-        
+        clear_search_context_for_user(user_id)
+
         return jsonify({"message": "Conversation cleared successfully"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500

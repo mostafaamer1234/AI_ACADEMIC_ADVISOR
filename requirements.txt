@@ -30,9 +30,6 @@ numpy==1.26.4
 networkx==3.2.1
 matplotlib==3.8.2
 
-# Graph Layout (for networkx drawing)
-pygraphviz==1.11
-
 # Fuzzy String Matching
 fuzzywuzzy==0.18.0
 python-levenshtein==0.23.0
