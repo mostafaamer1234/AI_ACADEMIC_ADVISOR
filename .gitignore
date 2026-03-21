@@ -30,3 +30,7 @@ flask_server.log
 
 # Chroma vector DB (local data)
 chroma_data/
+
+# Markdown docs (keep locally, main README.md stays in repo)
+*.md
+!README.md
