@@ -1,5 +1,15 @@
 import os
 import json
+
+from dotenv import load_dotenv
+
+_llm_dir = os.path.dirname(os.path.abspath(__file__))
+for _p in [os.path.join(_llm_dir, "..", ".env"), os.path.join(_llm_dir, "..", "..", "..", ".env")]:
+    if os.path.exists(_p):
+        load_dotenv(_p)
+        break
+else:
+    load_dotenv()
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -14,15 +24,14 @@ PRIMARY_MODEL_NAME = os.getenv("ADVISOR_MODEL_NAME", "gpt-5.4-mini")
 def setup_environment(whatIfUpload):
     global pdf_retriever, courses_retriever, llm1, llm2
 
-    #  Environment Variables
+    #  Environment Variables (set via .env - see .env.example)
     LANGCHAIN_PROJECT = "pr-notable-garbage-99"
-    os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-    os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
+    os.environ.setdefault('LANGCHAIN_TRACING_V2', 'true')
+    os.environ.setdefault('LANGCHAIN_ENDPOINT', 'https://api.smith.langchain.com')
+    os.environ.setdefault('OPENAI_API_BASE', 'https://api.openai.com/v1')
 
-    # HAVE TO MODIFY THESE 2
-    os.environ['LANGCHAIN_API_KEY'] = 'REDACTED'
-    os.environ['OPENAI_API_KEY'] = "REDACTED"
-    os.environ['OPENAI_API_BASE'] = 'https://api.openai.com/v1'
+    if not os.getenv('OPENAI_API_KEY'):
+        raise RuntimeError("OPENAI_API_KEY not set. Add it to .env (see .env.example)")
 
     #  Handle Uploaded Transcript
     transcript_file = whatIfUpload.files['transcript']

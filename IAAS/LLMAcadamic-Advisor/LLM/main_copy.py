@@ -1,5 +1,19 @@
 import os
 import sys
+
+from dotenv import load_dotenv
+
+# Load .env from IAAS/LLMAcadamic-Advisor or repo root
+_llm_dir = os.path.dirname(os.path.abspath(__file__))
+for _env_path in [
+    os.path.join(_llm_dir, "..", ".env"),  # IAAS/LLMAcadamic-Advisor/.env
+    os.path.join(_llm_dir, "..", "..", "..", ".env"),  # repo root
+]:
+    if os.path.exists(_env_path):
+        load_dotenv(_env_path)
+        break
+else:
+    load_dotenv()
 import re
 import json
 import shutil
@@ -1413,17 +1427,18 @@ def setup_environment(whatIfUpload=None, user_id='default'):
     os.makedirs(os.path.join(CHROMA_DATA_DIR, "courses"), exist_ok=True)
     os.makedirs(os.path.join(CHROMA_DATA_DIR, "transcripts"), exist_ok=True)
 
-    #  Environment Variables
+    #  Environment Variables (set via .env or system env)
     LANGCHAIN_PROJECT = "pr-notable-garbage-99"
-    os.environ['LANGCHAIN_TRACING_V2'] = 'true'
-    os.environ['LANGCHAIN_ENDPOINT'] = 'https://api.smith.langchain.com'
-    os.environ['LANGCHAIN_API_KEY'] = 'REDACTED'
-    os.environ['OPENAI_API_KEY'] = "REDACTED"
+    os.environ.setdefault('LANGCHAIN_TRACING_V2', 'true')
+    os.environ.setdefault('LANGCHAIN_ENDPOINT', 'https://api.smith.langchain.com')
 
-    if not os.getenv('LANGCHAIN_API_KEY'):
-        print("⚠️ LANGCHAIN_API_KEY is not set in the environment.")
     if not os.getenv('OPENAI_API_KEY'):
-        print("⚠️ OPENAI_API_KEY is not set in the environment.")
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set. Add it to .env or set the environment variable. "
+            "See .env.example for the format."
+        )
+    if not os.getenv('LANGCHAIN_API_KEY'):
+        print("⚠️ LANGCHAIN_API_KEY is not set (optional, for LangSmith tracing).")
 
     # ---- Optional transcript / What-If report ----
     if whatIfUpload is not None and 'transcript' in whatIfUpload.files:
@@ -3961,11 +3976,9 @@ def generate_conversational_response(
             setup_environment(None)
         except Exception as e:
             print(f"⚠️ Error initializing LLMs: {e}")
-            from langchain_openai import ChatOpenAI
             if not os.getenv('OPENAI_API_KEY'):
-                os.environ['OPENAI_API_KEY'] = "REDACTED"
-            if not os.getenv('LANGCHAIN_API_KEY'):
-                os.environ['LANGCHAIN_API_KEY'] = 'REDACTED'
+                raise RuntimeError("OPENAI_API_KEY not set. Add it to .env in IAAS/LLMAcadamic-Advisor/")
+            from langchain_openai import ChatOpenAI
             llm1 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
             llm2 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
             llm_classifier = ChatOpenAI(model_name=CLASSIFIER_MODEL_NAME, temperature=0)
@@ -4045,12 +4058,9 @@ def generate_plan_from_major_and_year(major, year_level, target_grad_in_years=4)
             setup_environment(None)  # Initialize without transcript
         except Exception as e:
             print(f"⚠️ Error in setup_environment: {e}")
-            # Manual initialization as fallback
-            from langchain_openai import ChatOpenAI
             if not os.getenv('OPENAI_API_KEY'):
-                os.environ['OPENAI_API_KEY'] = "REDACTED"
-            if not os.getenv('LANGCHAIN_API_KEY'):
-                os.environ['LANGCHAIN_API_KEY'] = 'REDACTED'
+                raise RuntimeError("OPENAI_API_KEY not set. Add it to .env in IAAS/LLMAcadamic-Advisor/")
+            from langchain_openai import ChatOpenAI
             llm1 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
             llm2 = ChatOpenAI(model_name=PRIMARY_MODEL_NAME, temperature=0)
     

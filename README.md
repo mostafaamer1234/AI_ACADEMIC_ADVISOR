@@ -368,14 +368,20 @@ cd ..
 
 ### 3. Configure environment
 
-Recommended variables:
+**API keys** (never commit real keys to git): copy `.env.example` to `.env` in `IAAS/LLMAcadamic-Advisor/`:
 
 ```bash
-export OPENAI_API_KEY=...
+cd IAAS/LLMAcadamic-Advisor
+cp .env.example .env
+# Edit .env and add your OPENAI_API_KEY
+```
+
+Other recommended variables:
+
+```bash
 export AGENT_DEBUG_TRACE=true
 export REACT_APP_LLM_URL=http://127.0.0.1:5002/llm
 export MYSQL_DISABLE=true
-export TAVILY_API_KEY=...
 ```
 
 `MYSQL_DISABLE=true` is useful if you want to run the advising system without the auth database.
