@@ -373,7 +373,7 @@ cd ..
 ```bash
 cd IAAS/LLMAcadamic-Advisor
 cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
+# Edit .env: OPENAI_API_KEY (required), LANGCHAIN_API_KEY and LANGCHAIN_PROJECT (LangSmith tracing)
 ```
 
 Other recommended variables:

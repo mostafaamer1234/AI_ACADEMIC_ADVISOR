@@ -25,9 +25,9 @@ def setup_environment(whatIfUpload):
     global pdf_retriever, courses_retriever, llm1, llm2
 
     #  Environment Variables (set via .env - see .env.example)
-    LANGCHAIN_PROJECT = "pr-notable-garbage-99"
     os.environ.setdefault('LANGCHAIN_TRACING_V2', 'true')
     os.environ.setdefault('LANGCHAIN_ENDPOINT', 'https://api.smith.langchain.com')
+    os.environ['LANGCHAIN_PROJECT'] = os.getenv('LANGCHAIN_PROJECT', 'iaas-advisor')
     os.environ.setdefault('OPENAI_API_BASE', 'https://api.openai.com/v1')
 
     if not os.getenv('OPENAI_API_KEY'):

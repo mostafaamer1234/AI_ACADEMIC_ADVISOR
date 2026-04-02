@@ -1428,9 +1428,10 @@ def setup_environment(whatIfUpload=None, user_id='default'):
     os.makedirs(os.path.join(CHROMA_DATA_DIR, "transcripts"), exist_ok=True)
 
     #  Environment Variables (set via .env or system env)
-    LANGCHAIN_PROJECT = "pr-notable-garbage-99"
     os.environ.setdefault('LANGCHAIN_TRACING_V2', 'true')
     os.environ.setdefault('LANGCHAIN_ENDPOINT', 'https://api.smith.langchain.com')
+    _lc_project = os.getenv('LANGCHAIN_PROJECT', 'iaas-advisor')
+    os.environ['LANGCHAIN_PROJECT'] = _lc_project
 
     if not os.getenv('OPENAI_API_KEY'):
         raise RuntimeError(
