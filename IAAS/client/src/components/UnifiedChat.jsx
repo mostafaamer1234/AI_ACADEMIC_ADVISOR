@@ -4,6 +4,43 @@ import { generateResponse, setupEnvironment, clearConversation } from '../servic
 import MarkdownRenderer from './MarkdownRenderer';
 import '../styles/UnifiedChat.css';
 
+import AutoAwesomeRoundedIcon from '@mui/icons-material/AutoAwesomeRounded';
+import AccountTreeRoundedIcon from '@mui/icons-material/AccountTreeRounded';
+import UploadFileRoundedIcon from '@mui/icons-material/UploadFileRounded';
+import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded';
+import DeleteOutlineRoundedIcon from '@mui/icons-material/DeleteOutlineRounded';
+import SendRoundedIcon from '@mui/icons-material/SendRounded';
+import PersonRoundedIcon from '@mui/icons-material/PersonRounded';
+import SchoolRoundedIcon from '@mui/icons-material/SchoolRounded';
+import MenuBookRoundedIcon from '@mui/icons-material/MenuBookRounded';
+import InsightsRoundedIcon from '@mui/icons-material/InsightsRounded';
+import LightbulbRoundedIcon from '@mui/icons-material/LightbulbRounded';
+import ErrorOutlineRoundedIcon from '@mui/icons-material/ErrorOutlineRounded';
+import ScheduleRoundedIcon from '@mui/icons-material/ScheduleRounded';
+
+const FEATURE_CARDS = [
+    {
+        icon: <MenuBookRoundedIcon fontSize="small" />,
+        title: 'Course lookups',
+        blurb: 'Credits, prerequisites, and descriptions from the live Penn State catalog.',
+    },
+    {
+        icon: <SchoolRoundedIcon fontSize="small" />,
+        title: 'Major requirements',
+        blurb: 'Full degree audits, prescribed sequences, and gen-ed buckets.',
+    },
+    {
+        icon: <InsightsRoundedIcon fontSize="small" />,
+        title: 'Graduation planning',
+        blurb: 'Personalized 8-semester roadmaps that respect prereqs.',
+    },
+    {
+        icon: <LightbulbRoundedIcon fontSize="small" />,
+        title: 'Smart recommendations',
+        blurb: 'Next-best courses tuned to your transcript and interests.',
+    },
+];
+
 const UnifiedChat = () => {
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
@@ -14,9 +51,9 @@ const UnifiedChat = () => {
     const [conversationHistory, setConversationHistory] = useState([]);
     const chatEndRef = useRef(null);
     const fileInputRef = useRef(null);
+    const textareaRef = useRef(null);
     const navigate = useNavigate();
-    
-    // Create or reuse a per-tab session id for isolation
+
     const getSessionId = () => {
         let sessionId = sessionStorage.getItem('session_id');
         if (!sessionId) {
@@ -28,46 +65,66 @@ const UnifiedChat = () => {
         return sessionId;
     };
 
-    // Load conversation history from sessionStorage on mount
     useEffect(() => {
         const sessionId = getSessionId();
         const savedHistory = sessionStorage.getItem(`chat_history_${sessionId}`);
         const savedMessages = sessionStorage.getItem(`chat_messages_${sessionId}`);
         const savedTranscriptFlag = sessionStorage.getItem(`transcript_uploaded_${sessionId}`);
         if (savedHistory) {
-            try {
-                setConversationHistory(JSON.parse(savedHistory));
-            } catch (e) {
-                console.error('Error loading conversation history:', e);
-            }
+            try { setConversationHistory(JSON.parse(savedHistory)); } catch (_) {}
         }
         if (savedMessages) {
             try {
                 const parsedMessages = JSON.parse(savedMessages);
-                // Convert timestamp strings back to Date objects
                 const messagesWithDates = parsedMessages.map(msg => ({
                     ...msg,
                     timestamp: msg.timestamp ? new Date(msg.timestamp) : new Date()
                 }));
                 setMessages(messagesWithDates);
-            } catch (e) {
-                console.error('Error loading messages:', e);
-            }
+            } catch (_) {}
         }
-        if (savedTranscriptFlag === 'true') {
-            setTranscriptUploaded(true);
-        }
-        
-        // Cleanup function - clear chat when component unmounts (user navigates away)
-        return () => {
-            // Don't clear on unmount, only on explicit logout
-            // The cleanup is handled in handleLogout
-        };
+        if (savedTranscriptFlag === 'true') setTranscriptUploaded(true);
     }, []);
 
-    // Save conversation history to sessionStorage
+    // #region agent log
+    useEffect(() => {
+        const dbg = (location, message, data, hypothesisId) => {
+            fetch('http://127.0.0.1:7344/ingest/7aa39296-269f-4d56-80dd-ed67ff600ceb', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '97c192' },
+                body: JSON.stringify({ sessionId: '97c192', location, message, data, hypothesisId, timestamp: Date.now() }),
+            }).catch(() => {});
+        };
+        window.__iaasDbg = dbg;
+        const longtaskCounts = { total: 0, maxMs: 0, sumMs: 0, over100: 0 };
+        try {
+            const po = new PerformanceObserver((list) => {
+                for (const entry of list.getEntries()) {
+                    longtaskCounts.total += 1;
+                    longtaskCounts.sumMs += entry.duration;
+                    if (entry.duration > longtaskCounts.maxMs) longtaskCounts.maxMs = entry.duration;
+                    if (entry.duration > 100) longtaskCounts.over100 += 1;
+                }
+            });
+            po.observe({ entryTypes: ['longtask'] });
+            const flush = setInterval(() => {
+                if (longtaskCounts.total > 0) {
+                    dbg('UnifiedChat.jsx:longtask_window', 'main-thread long tasks observed in last 2s', { ...longtaskCounts }, 'H1');
+                    longtaskCounts.total = 0; longtaskCounts.maxMs = 0; longtaskCounts.sumMs = 0; longtaskCounts.over100 = 0;
+                }
+            }, 2000);
+            return () => { po.disconnect(); clearInterval(flush); };
+        } catch (_) { return; }
+    }, []);
+    // #endregion
+
     useEffect(() => {
         const sessionId = getSessionId();
+        // #region agent log
+        const t0 = performance.now();
+        const hLen = conversationHistory.length;
+        const mLen = messages.length;
+        // #endregion
         if (conversationHistory.length > 0) {
             sessionStorage.setItem(`chat_history_${sessionId}`, JSON.stringify(conversationHistory));
         }
@@ -75,12 +132,43 @@ const UnifiedChat = () => {
             sessionStorage.setItem(`chat_messages_${sessionId}`, JSON.stringify(messages));
         }
         sessionStorage.setItem(`transcript_uploaded_${sessionId}`, transcriptUploaded ? 'true' : 'false');
+        // #region agent log
+        const dt = performance.now() - t0;
+        if (dt > 4 && typeof window.__iaasDbg === 'function') {
+            window.__iaasDbg('UnifiedChat.jsx:sessionStorage_effect', 'sessionStorage sync write duration', { durationMs: +dt.toFixed(2), historyLen: hLen, messagesLen: mLen }, 'H2');
+        }
+        // #endregion
     }, [conversationHistory, messages, transcriptUploaded]);
 
-    // Auto-scroll to bottom when new messages arrive
     useEffect(() => {
+        // #region agent log
+        const t0 = performance.now();
+        // #endregion
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [messages]);
+        // #region agent log
+        const dt = performance.now() - t0;
+        if (typeof window.__iaasDbg === 'function') {
+            window.__iaasDbg('UnifiedChat.jsx:scrollIntoView_effect', 'scrollIntoView call duration', { durationMs: +dt.toFixed(2), messagesLen: messages.length, isLoading }, 'H3');
+        }
+        // #endregion
+    }, [messages, isLoading]);
+
+    // Auto-grow textarea
+    useEffect(() => {
+        // #region agent log
+        const t0 = performance.now();
+        // #endregion
+        const el = textareaRef.current;
+        if (!el) return;
+        el.style.height = 'auto';
+        el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
+        // #region agent log
+        const dt = performance.now() - t0;
+        if (dt > 2 && typeof window.__iaasDbg === 'function') {
+            window.__iaasDbg('UnifiedChat.jsx:textarea_autogrow', 'textarea autogrow layout read+write duration', { durationMs: +dt.toFixed(2), inputLen: input.length }, 'H4');
+        }
+        // #endregion
+    }, [input]);
 
     const handleFileUpload = async (e) => {
         const file = e.target.files[0];
@@ -88,36 +176,30 @@ const UnifiedChat = () => {
 
         setIsUploading(true);
         setError('');
-        
+
         try {
             const formData = new FormData();
             formData.append('transcript', file);
-            
             const sessionId = getSessionId();
             const message = await setupEnvironment(formData, sessionId);
             console.log('Environment initialized:', message);
-            
             setTranscriptUploaded(true);
-            
-            // Add system message about transcript upload
+
             const uploadMessage = {
                 id: Date.now(),
                 role: 'assistant',
-                content: '✅ Your transcript has been uploaded successfully! I can now provide personalized course planning, graduation plans, and answer questions specific to your academic progress. What would you like to know?',
-                timestamp: new Date()
+                content:
+                    "Transcript received. I can now tailor graduation plans, course picks, and audits to your record. What would you like me to dig into first?",
+                timestamp: new Date(),
+                kind: 'transcript-ack',
             };
-            
             setMessages(prev => [...prev, uploadMessage]);
-            
-        } catch (error) {
-            console.error('Error uploading transcript:', error);
+        } catch (err) {
+            console.error('Error uploading transcript:', err);
             setError('Failed to upload transcript. Please try again.');
         } finally {
             setIsUploading(false);
-            // Reset file input
-            if (fileInputRef.current) {
-                fileInputRef.current.value = '';
-            }
+            if (fileInputRef.current) fileInputRef.current.value = '';
         }
     };
 
@@ -142,35 +224,30 @@ const UnifiedChat = () => {
                 conversationHistory,
                 getSessionId()
             );
-
             const aiMessage = {
                 id: Date.now() + 1,
                 role: 'assistant',
                 content: result.response,
                 timestamp: new Date()
             };
-
             setMessages(prev => [...prev, aiMessage]);
             setConversationHistory(result.conversationHistory || []);
-        } catch (error) {
-            console.error('Error sending message:', error);
+        } catch (err) {
+            console.error('Error sending message:', err);
             setError('Failed to get a response. Please try again.');
-            
-            // Add error message to chat
-            const errorMessage = {
+            setMessages(prev => [...prev, {
                 id: Date.now() + 1,
                 role: 'assistant',
-                content: 'Sorry, I encountered an error. Please try again.',
+                content: 'Something went sideways reaching the advisor service. Try again in a moment.',
                 timestamp: new Date(),
                 isError: true
-            };
-            setMessages(prev => [...prev, errorMessage]);
+            }]);
         } finally {
             setIsLoading(false);
         }
     };
 
-    const handleKeyPress = (e) => {
+    const handleKeyDown = (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             handleSendMessage();
@@ -178,131 +255,221 @@ const UnifiedChat = () => {
     };
 
     const handleClearChat = async () => {
-        if (window.confirm('Are you sure you want to clear the conversation?')) {
-            try {
-                const sessionId = getSessionId();
-                await clearConversation(sessionId);
-                setMessages([]);
-                setConversationHistory([]);
-                setTranscriptUploaded(false);
-                sessionStorage.removeItem(`chat_history_${sessionId}`);
-                sessionStorage.removeItem(`chat_messages_${sessionId}`);
-                sessionStorage.removeItem(`transcript_uploaded_${sessionId}`);
-            } catch (error) {
-                console.error('Error clearing conversation:', error);
-            }
+        if (!window.confirm('Clear the current conversation? Your transcript upload will also be removed.')) {
+            return;
         }
+        const sessionId = getSessionId();
+        try {
+            await clearConversation(sessionId);
+        } catch (err) {
+            console.error('Error clearing conversation on server:', err);
+            // Continue with local cleanup even if the server call failed so the UI
+            // never ends up in a half-cleared state.
+        }
+
+        setMessages([]);
+        setConversationHistory([]);
+        setTranscriptUploaded(false);
+        setInput('');
+        setError('');
+        setIsLoading(false);
+        setIsUploading(false);
+
+        if (fileInputRef.current) {
+            fileInputRef.current.value = '';
+        }
+        if (textareaRef.current) {
+            textareaRef.current.style.height = 'auto';
+        }
+
+        sessionStorage.removeItem(`chat_history_${sessionId}`);
+        sessionStorage.removeItem(`chat_messages_${sessionId}`);
+        sessionStorage.removeItem(`transcript_uploaded_${sessionId}`);
+    };
+
+    const formatTimestamp = (ts) => {
+        const d = ts instanceof Date ? ts : new Date(ts);
+        return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
     };
 
     return (
-        <div className="unified-chat-container">
-            <div className="chat-header">
-                <h2>AI Academic Advisor</h2>
-                <div className="chat-header-actions">
+        <div className="iaas-shell">
+            <header className="iaas-header">
+                <div className="iaas-brand">
+                    <span className="iaas-brand-mark">
+                        <AutoAwesomeRoundedIcon fontSize="small" />
+                    </span>
+                    <div className="iaas-brand-text">
+                        <span className="iaas-brand-title">Academic Advisor</span>
+                        <span className="iaas-brand-sub">Penn State Abington · AI powered</span>
+                    </div>
+                </div>
+
+                <div className="iaas-header-actions">
                     <button
+                        type="button"
+                        className="iaas-chip"
                         onClick={() => navigate('/faculty-dashboard')}
-                        className="course-graph-button"
+                        title="Open the prerequisite graph"
                     >
-                        📈 Course Graph
+                        <AccountTreeRoundedIcon fontSize="small" />
+                        <span>Course Graph</span>
                     </button>
-                    <label className="upload-button">
-                        {transcriptUploaded ? '✅ Transcript Uploaded' : '📄 Upload Transcript'}
+
+                    <label
+                        className={`iaas-chip ${transcriptUploaded ? 'iaas-chip-ok' : ''} ${isUploading ? 'iaas-chip-busy' : ''}`}
+                        title={transcriptUploaded ? 'Transcript on file' : 'Upload your transcript (PDF)'}
+                    >
+                        {transcriptUploaded ? (
+                            <CheckCircleRoundedIcon fontSize="small" />
+                        ) : (
+                            <UploadFileRoundedIcon fontSize="small" />
+                        )}
+                        <span>{transcriptUploaded ? 'Transcript on file' : (isUploading ? 'Uploading…' : 'Upload transcript')}</span>
                         <input
                             ref={fileInputRef}
                             type="file"
                             accept=".pdf"
                             onChange={handleFileUpload}
-                            style={{ display: 'none' }}
                             disabled={isUploading}
                         />
                     </label>
+
                     {messages.length > 0 && (
-                        <button onClick={handleClearChat} className="clear-button">
-                            🗑️ Clear Chat
+                        <button
+                            type="button"
+                            className="iaas-chip iaas-chip-danger"
+                            onClick={handleClearChat}
+                            title="Clear the conversation"
+                        >
+                            <DeleteOutlineRoundedIcon fontSize="small" />
+                            <span>Clear</span>
                         </button>
                     )}
                 </div>
-            </div>
+            </header>
 
-            {messages.length === 0 && (
-                <div className="welcome-message">
-                    <p>I'm your AI Academic Advisor. Feel free to ask me anything about:</p>
-                    <ul>
-                        <li>Course information and prerequisites</li>
-                        <li>Major requirements</li>
-                        <li>General academic advice</li>
-                        <li>Graduation planning (better with transcript)</li>
-                        <li>Course recommendations</li>
-                    </ul>
-                    <p className="welcome-tip">
-                        💡 Tip: Upload your transcript for personalized graduation planning and course recommendations based on your academic history.
-                    </p>
+            <main className="iaas-stream">
+                {messages.length === 0 && (
+                    <section className="iaas-hero">
+                        <div className="iaas-hero-badge">
+                            <AutoAwesomeRoundedIcon fontSize="small" />
+                            <span>Your personal academic co-pilot</span>
+                        </div>
+                        <h1 className="iaas-hero-title">
+                            Plan smarter. <span>Graduate faster.</span>
+                        </h1>
+                        <p className="iaas-hero-sub">
+                            Ask anything about courses, majors, prerequisites, or graduation planning.
+                            Upload your transcript and I'll personalize every recommendation.
+                        </p>
+                        <div className="iaas-feature-grid">
+                            {FEATURE_CARDS.map((f) => (
+                                <div key={f.title} className="iaas-feature-card">
+                                    <span className="iaas-feature-icon">{f.icon}</span>
+                                    <div className="iaas-feature-copy">
+                                        <div className="iaas-feature-title">{f.title}</div>
+                                        <div className="iaas-feature-blurb">{f.blurb}</div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </section>
+                )}
+
+                <div className="iaas-messages">
+                    {messages.map((message) => {
+                        const isUser = message.role === 'user';
+                        const isError = !!message.isError;
+                        return (
+                            <div
+                                key={message.id}
+                                className={`iaas-row ${isUser ? 'iaas-row-user' : 'iaas-row-ai'} ${isError ? 'iaas-row-error' : ''}`}
+                            >
+                                <div className={`iaas-avatar ${isUser ? 'iaas-avatar-user' : 'iaas-avatar-ai'}`}>
+                                    {isUser
+                                        ? <PersonRoundedIcon fontSize="small" />
+                                        : (isError
+                                            ? <ErrorOutlineRoundedIcon fontSize="small" />
+                                            : <AutoAwesomeRoundedIcon fontSize="small" />)}
+                                </div>
+                                <div className="iaas-bubble-wrap">
+                                    <div className="iaas-bubble-meta">
+                                        <span className="iaas-bubble-author">
+                                            {isUser ? 'You' : 'Academic Advisor'}
+                                        </span>
+                                        <span className="iaas-bubble-time">
+                                            <ScheduleRoundedIcon fontSize="inherit" />
+                                            {formatTimestamp(message.timestamp)}
+                                        </span>
+                                    </div>
+                                    <div className={`iaas-bubble ${isUser ? 'iaas-bubble-user' : 'iaas-bubble-ai'} ${isError ? 'iaas-bubble-error' : ''}`}>
+                                        {isUser || isError
+                                            ? <div className="iaas-plain-text">{message.content}</div>
+                                            : <MarkdownRenderer content={message.content} />
+                                        }
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })}
+
+                    {isLoading && (
+                        <div className="iaas-row iaas-row-ai iaas-row-loading">
+                            <div className="iaas-avatar iaas-avatar-ai">
+                                <AutoAwesomeRoundedIcon fontSize="small" />
+                            </div>
+                            <div className="iaas-bubble-wrap">
+                                <div className="iaas-bubble iaas-bubble-ai">
+                                    <div className="iaas-typing">
+                                        <span /><span /><span />
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    <div ref={chatEndRef} />
+                </div>
+            </main>
+
+            {error && (
+                <div className="iaas-banner iaas-banner-error">
+                    <ErrorOutlineRoundedIcon fontSize="small" />
+                    <span>{error}</span>
                 </div>
             )}
 
-            <div className="chat-messages">
-                {messages.map((message) => (
-                    <div
-                        key={message.id}
-                        className={`message ${message.role} ${message.isError ? 'error' : ''}`}
+            <div className="iaas-composer">
+                <div className="iaas-composer-inner">
+                    <textarea
+                        ref={textareaRef}
+                        value={input}
+                        onChange={(e) => setInput(e.target.value)}
+                        onKeyDown={handleKeyDown}
+                        placeholder={transcriptUploaded
+                            ? "Ask about your plan, next courses, audits, prereqs…"
+                            : "Ask anything — or upload your transcript for personalized planning."}
+                        disabled={isLoading || isUploading}
+                        rows={1}
+                        className="iaas-composer-input"
+                    />
+                    <button
+                        type="button"
+                        onClick={handleSendMessage}
+                        disabled={isLoading || isUploading || !input.trim()}
+                        className="iaas-send"
+                        aria-label="Send"
                     >
-                        <div className="message-content">
-                            {message.role === 'assistant' && !message.isError ? (
-                                <MarkdownRenderer content={message.content} />
-                            ) : (
-                                message.content
-                            )}
-                        </div>
-                        <div className="message-timestamp">
-                            {message.timestamp instanceof Date 
-                                ? message.timestamp.toLocaleTimeString() 
-                                : new Date(message.timestamp).toLocaleTimeString()}
-                        </div>
-                    </div>
-                ))}
-                {isLoading && (
-                    <div className="message assistant loading">
-                        <div className="message-content">
-                            <span className="typing-indicator">
-                                <span></span>
-                                <span></span>
-                                <span></span>
-                            </span>
-                        </div>
-                    </div>
-                )}
-                <div ref={chatEndRef} />
+                        <SendRoundedIcon fontSize="small" />
+                    </button>
+                </div>
+                <div className="iaas-composer-hint">
+                    <span>Press <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a newline</span>
+                </div>
             </div>
-
-            {error && <div className="error-message">{error}</div>}
-
-            <div className="chat-input-container">
-                <input
-                    type="text"
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                    onKeyPress={handleKeyPress}
-                    placeholder={transcriptUploaded 
-                        ? "Ask me anything about your courses, graduation plan, or academic requirements..." 
-                        : "Ask me anything! (Upload transcript for personalized planning)..."}
-                    disabled={isLoading || isUploading}
-                    className="chat-input"
-                />
-                <button
-                    onClick={handleSendMessage}
-                    disabled={isLoading || isUploading || !input.trim()}
-                    className="send-button"
-                >
-                    {isLoading ? '⏳' : '📤'}
-                </button>
-            </div>
-
-            {isUploading && (
-                <div className="upload-status">📤 Uploading transcript...</div>
-            )}
         </div>
     );
 };
 
 export default UnifiedChat;
-

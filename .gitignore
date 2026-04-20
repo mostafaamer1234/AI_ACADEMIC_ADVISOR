@@ -39,3 +39,9 @@ chroma_data/
 # Markdown docs (keep locally, main README.md stays in repo)
 *.md
 !README.md
+
+# Uploaded transcripts / personal PDFs (never commit)
+IAAS/LLMAcadamic-Advisor/LLM/*.pdf
+
+# Generated graph cache (regenerated on demand from CSVs + code)
+IAAS/LLMAcadamic-Advisor/LLM/cache/

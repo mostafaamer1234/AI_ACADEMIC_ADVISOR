@@ -40,10 +40,17 @@ def extract_prereq_and_concurrent(text):
     else:
         prereq_text, concurrent_text = text, ""
 
+    # PSU course numbers are 2-3 digits (MATH 21, ENGL 15, ART 11) with an
+    # optional single-letter suffix (ENGL 202D, ART 122Y). The previous regex
+    # required exactly 3 digits, which silently dropped every 2-digit prereq
+    # at graph-build time — that's why MATH 140 came back as "no prereqs":
+    # its real prereq "MATH 22 AND MATH 26" never made it into the graph.
+    course_code_pat = r'[A-Z]{2,}\s+\d{2,3}[A-Z]?'
+
     # Handle prereq logic (supporting OR)
     prereq_or_groups = re.split(r'\s+OR\s+', prereq_text)
     for group in prereq_or_groups:
-        matches = re.findall(r'[A-Z]{2,}\s\d{3}[A-Z]?', group)
+        matches = re.findall(course_code_pat, group)
         if matches:
             if 'AND' in group:
                 prereqs.extend(matches)
@@ -59,12 +66,12 @@ def extract_prereq_and_concurrent(text):
     grouped = re.split(r'\s+OR\s+', concurrent_text)
     for g in grouped:
         if 'AND' in g:
-            and_group = re.findall(r'[A-Z]{2,}\s\d{3}[A-Z]?', g)
+            and_group = re.findall(course_code_pat, g)
             if and_group:
                 concurrents.extend(and_group)
                 concurrent_logic.append(' and '.join(and_group))
         else:
-            or_course = re.findall(r'[A-Z]{2,}\s\d{3}[A-Z]?', g)
+            or_course = re.findall(course_code_pat, g)
             if or_course:
                 concurrents.extend(or_course)
                 concurrent_logic.append(or_course[0])
@@ -77,8 +84,9 @@ def parse_course_codes_from_requirements(requirements_str):
     if not requirements_str or pd.isna(requirements_str):
         return []
 
-    # Remove parentheses and split by commas
-    courses = re.findall(r'[A-Z]{2,}\s+\d{3}[A-Z]?', requirements_str)
+    # 2-3 digit course numbers (PSU has both shapes — see note in
+    # extract_prereq_and_concurrent above).
+    courses = re.findall(r'[A-Z]{2,}\s+\d{2,3}[A-Z]?', requirements_str)
     return [course.strip() for course in courses]
 
 

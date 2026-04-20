@@ -21,6 +21,7 @@ from LLM.main_copy import aggregate_and_generate_response
 from LLM.main_copy import generate_conversational_response
 from LLM.main_copy import get_execution_trace_for_user
 from LLM.main_copy import clear_search_context_for_user
+from LLM.main_copy import reset_uploaded_transcript_state
 from LLM.majorsGraph import MajorGraph
 
 # Import Flask modules
@@ -189,16 +190,44 @@ def generate_graduation_plan():
 
 @app.route('/llm/clear-conversation', methods=['POST'])
 def clear_conversation():
-    """Clear conversation history for a user"""
+    """
+    Clear everything tied to the current chat session:
+      - conversation history
+      - active web-search context
+      - per-user transcript hash (so the agent no longer scopes caches to an old doc)
+      - module-level transcript state (pdf retriever, stored docs, extracted student data)
+      - any cached responses scoped to this user
+
+    The transcript vectorstore collection on disk is left in place (it is TTL-managed);
+    wiping the in-memory state is enough to stop the agent from consulting the document.
+    """
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         user_id = data.get('user_id', 'default')
-        
+
         if user_id in conversation_storage:
             conversation_storage[user_id] = []
         clear_search_context_for_user(user_id)
 
-        return jsonify({"message": "Conversation cleared successfully"}), 200
+        user_transcript_hash.pop(user_id, None)
+        reset_uploaded_transcript_state()
+
+        stale_cache_keys = [
+            k for k, v in RESPONSE_CACHE.items()
+            if isinstance(v, dict) and v.get('user_id') == user_id
+        ]
+        for k in stale_cache_keys:
+            RESPONSE_CACHE.pop(k, None)
+
+        return jsonify({
+            "message": "Conversation cleared successfully",
+            "cleared": {
+                "conversation_history": True,
+                "search_context": True,
+                "transcript_state": True,
+                "response_cache_entries": len(stale_cache_keys),
+            }
+        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -328,6 +357,20 @@ def generate_major_graph():
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({"error": f"Failed to generate graph: {str(e)}"}), 500
+
+
+@app.route('/llm/clear-major-graph-cache', methods=['POST'])
+def clear_major_graph_cache():
+    try:
+        csv_path = os.path.join(os.path.dirname(__file__), '..', 'LLM', 'all_abington_majors_combined(5).csv')
+        if not os.path.exists(csv_path):
+            return jsonify({"error": f"CSV file not found at: {csv_path}"}), 500
+        mg = MajorGraph(csv_path)
+        removed = mg.clear_cache()
+        return jsonify({"removed": removed}), 200
+    except Exception as e:
+        logger.error(f"Error clearing cache: {str(e)}")
+        return jsonify({"error": f"Failed to clear cache: {str(e)}"}), 500
 
 
 if __name__ == '__main__':

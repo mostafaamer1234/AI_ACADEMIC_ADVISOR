@@ -21,8 +21,27 @@ import hashlib
 import pickle
 import requests
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Callable
 from urllib.parse import urlparse, urljoin
+import time as _dbg_time
+
+# #region debug log helper (debug session 97c192)
+_DBG_LOG_PATH = "/Users/mostafa/newFianlLLMRepo/.cursor/debug-97c192.log"
+def _dbg(hyp: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    try:
+        with open(_DBG_LOG_PATH, "a") as _f:
+            _f.write(json.dumps({
+                "sessionId": "97c192",
+                "runId": "r1",
+                "hypothesisId": hyp,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": int(_dbg_time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+# #endregion
 from html import unescape
 
 # Add current directory to Python path BEFORE importing local modules
@@ -45,8 +64,13 @@ import pandas as pd
 
 from graphExperiment import course_graph, get_course_prerequisites, get_major_course_codes
 from orchestration_pipeline import (
+    ADVISOR_PERSONA,
     ExecutorResult,
     OrchestrationPlan,
+    _canonical_path_for_domain,
+    _canonical_tools_for_path,
+    _parse_prereq_graph_text,
+    _requires_grounded_answer,
     run_three_stage_pipeline,
 )
 from web_search_pipeline import (
@@ -168,9 +192,32 @@ def is_academic_or_policy_question(text: str) -> bool:
 
 
 def _response_indicates_no_answer_found(response: str) -> bool:
-    """Check if the LLM response indicates it couldn't find the answer in available data."""
+    """True only when the LLM response is *entirely* a "couldn't answer" message.
+
+    This gatekeeper exists to detect total give-ups (e.g., a 30-character
+    "I don't have any information on that") so we can fall through to the
+    web-search backstop. It must NOT fire on real, structured plans that
+    happen to acknowledge one missing data point — that mistake threw away
+    a perfectly good Art + Econ double-major plan in production because
+    the synthesizer (correctly!) said "I don't have X for the option
+    track" inside an otherwise complete answer.
+
+    Logic:
+      * Short / empty responses → no answer.
+      * Response contains a "Semester N" block, two or more PSU-style
+        course codes, or is reasonably long (≥ 800 chars) → real answer
+        regardless of the indicator phrases.
+      * Otherwise apply the phrase scan.
+    """
     if not response or len(response.strip()) < 20:
         return True
+    if re.search(r"\bSemester\s+\d", response, re.IGNORECASE):
+        return False
+    course_codes = re.findall(r"\b[A-Z]{2,}\s+\d{2,3}[A-Z]?\b", response)
+    if len(set(c.upper() for c in course_codes)) >= 2:
+        return False
+    if len(response.strip()) > 800:
+        return False
     lower = response.lower()
     indicators = [
         "couldn't find", "could not find", "isn't present", "not in the policy",
@@ -1343,6 +1390,22 @@ def clear_search_context_for_user(user_id: str):
     clear_active_search_context(user_id)
 
 
+def reset_uploaded_transcript_state() -> None:
+    """
+    Drop any uploaded-transcript state held at module scope so subsequent queries
+    do not reuse a previous upload's retriever or extracted student data.
+
+    This is what "clear chat" needs in addition to wiping conversation history —
+    otherwise the agent still sees the last student's transcript even after the
+    UI has marked the document as removed.
+    """
+    global pdf_retriever, stored_pdf_docs, latest_student_data, has_transcript
+    pdf_retriever = None
+    stored_pdf_docs = None
+    latest_student_data = None
+    has_transcript = False
+
+
 class CachedEmbeddings:
     """Wrapper around OpenAIEmbeddings that caches results."""
     
@@ -1514,6 +1577,7 @@ def setup_environment(whatIfUpload=None, user_id='default'):
     else:
         pdf_retriever = None
         stored_pdf_docs = None
+        latest_student_data = None
         has_transcript = False
         print("ℹ️ No transcript provided. Running in no-transcript mode.")
 
@@ -2632,6 +2696,106 @@ def _slice_semester_plan_text(plan_text: str, semester_horizon: int) -> str:
     return "\n---\n".join(blocks[:semester_horizon]).strip()
 
 
+# ---------------------------------------------------------------------------
+# Target-semester parsing.
+#
+# A question like "first semester courses for computer science" or
+# "3rd semester of biology, B.S." pins a specific semester of the standard
+# graduation plan. We map this onto:
+#   - semester_number in 1..8 (absolute index from freshman fall)
+#   - year_level for generate_plan_from_major_and_year (so the deterministic
+#     planner starts its output at the right semester number)
+#   - horizon (1 for a single semester, 2 for a full academic year)
+#
+# This is used by the major_lookup executor path to route semester-specific
+# major questions to the deterministic planner instead of LLM synthesis.
+# ---------------------------------------------------------------------------
+
+_ORDINAL_TO_SEMESTER = {
+    "1st": 1, "first": 1,
+    "2nd": 2, "second": 2,
+    "3rd": 3, "third": 3,
+    "4th": 4, "fourth": 4,
+    "5th": 5, "fifth": 5,
+    "6th": 6, "sixth": 6,
+    "7th": 7, "seventh": 7,
+    "8th": 8, "eighth": 8,
+}
+
+_YEAR_SEMESTER_START = {"freshman": 1, "sophomore": 3, "junior": 5, "senior": 7}
+
+
+def _year_level_for_semester(n: int) -> str:
+    if n <= 2:
+        return "freshman"
+    if n <= 4:
+        return "sophomore"
+    if n <= 6:
+        return "junior"
+    return "senior"
+
+
+def _extract_target_semester_request(question: str) -> Optional[Dict[str, Any]]:
+    """Parse a natural-language question for a specific target semester.
+
+    Returns ``{"semester_number": N, "year_level": str, "horizon": int}`` when
+    the question pins a concrete semester; otherwise ``None``.
+
+    Supported phrasings (case-insensitive):
+      - ``first semester``, ``1st semester``, ``semester 1``  -> (1, freshman, 1)
+      - ``3rd semester``, ``semester 3``                       -> (3, sophomore, 1)
+      - ``freshman fall``, ``sophomore spring``                -> (start/+1, 1)
+      - ``freshman year``, ``junior year``                     -> (start, year, 2)
+    """
+    if not question:
+        return None
+    lowered = question.lower()
+
+    for word, n in _ORDINAL_TO_SEMESTER.items():
+        if re.search(rf"\b{word}\s+semester\b", lowered):
+            return {
+                "semester_number": n,
+                "year_level": _year_level_for_semester(n),
+                "horizon": 1,
+            }
+
+    m = re.search(r"\bsemester\s+(\d)\b", lowered)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 8:
+            return {
+                "semester_number": n,
+                "year_level": _year_level_for_semester(n),
+                "horizon": 1,
+            }
+
+    for year, start in _YEAR_SEMESTER_START.items():
+        if re.search(rf"\b{year}\s+fall\b", lowered):
+            return {"semester_number": start, "year_level": year, "horizon": 1}
+        if re.search(rf"\b{year}\s+spring\b", lowered):
+            return {"semester_number": start + 1, "year_level": year, "horizon": 1}
+
+    for year, start in _YEAR_SEMESTER_START.items():
+        if re.search(rf"\b{year}\s+year\b", lowered):
+            return {"semester_number": start, "year_level": year, "horizon": 2}
+
+    return None
+
+
+def _extract_semester_block_by_number(plan_text: str, semester_number: int) -> Optional[str]:
+    """Return the block labeled ``Semester N:`` from a formatted plan.
+
+    ``_format_plan_structure`` labels blocks with absolute semester numbers
+    (e.g. a plan generated for a sophomore starts at ``Semester 3:``), so we
+    can pick out the target semester directly rather than relying on position.
+    """
+    for block in _extract_semester_blocks_from_text(plan_text):
+        m = re.search(r"semester\s+\+?(\d+)", block, flags=re.IGNORECASE)
+        if m and int(m.group(1)) == semester_number:
+            return block
+    return None
+
+
 def _build_available_tool_inventory(has_transcript_for_plan: bool) -> List[str]:
     tools = ["conversation_history", "deterministic_planner", "web_search"]
     if has_transcript_for_plan:
@@ -3354,7 +3518,16 @@ def _build_transcript_plan_draft(
     )
     if not major_from_text or not year_from_text:
         return (
-            "I need your major and year level to build that plan. For example: 'Business sophomore' or 'Computer Science junior'.",
+            (
+                "Happy to put together a semester plan for you! To make it accurate I just need two quick "
+                "details:\n\n"
+                "- Your **major** (e.g., Computer Science, Business, Biology)\n"
+                "- Your current **year level** (freshman, sophomore, junior, or senior)\n\n"
+                "Once you share those (for example, 'Computer Science sophomore' or 'Business junior'), I "
+                "can build a 15-credit plan that matches your stage in the program. If you also upload your "
+                "academic transcript, I can personalize it around what you've already completed.\n\n"
+                "What's your major and year level?"
+            ),
             [],
             {"source": "missing_major_year"},
         )
@@ -3453,7 +3626,16 @@ def _build_course_lookup_draft_with_tools(
                 "source": "shared_search_pipeline",
                 **_resolved_search_to_metadata(search_result),
             }
-    return "I couldn't find that course. Please check the code (for example, 'CMPSC 131').", [], {"source": "course_lookup_not_found"}
+    return (
+        (
+            "I want to make sure I give you the right course details, but I couldn't locate that course in the "
+            "catalog. Could you double-check the course code (Penn State codes look like 'CMPSC 131' or "
+            "'MATH 140')? If you share the subject area or what you're hoping the course covers, I can also "
+            "suggest a few alternatives."
+        ),
+        [],
+        {"source": "course_lookup_not_found"},
+    )
 
 
 def _build_policy_lookup_draft(
@@ -3497,7 +3679,12 @@ def _build_policy_lookup_draft(
                 tools_used.append("policy_retriever")
                 policy_context = "\n\n".join(doc.page_content[:900] for doc in policy_docs[:4])
                 response = llm2.invoke([
-                    SystemMessage(content="Answer the student's question using ONLY the provided policy text. If the answer is not present, say you could not find it in the policy."),
+                    SystemMessage(content=(
+                        ADVISOR_PERSONA
+                        + "\n\nFor this turn you are answering a Penn State policy question. "
+                        "Answer using ONLY the provided policy text. If the answer is not present in the "
+                        "context, say so explicitly (do not guess), and suggest the right office to contact."
+                    )),
                     HumanMessage(content=f"{_get_current_datetime_context()}\nPolicy context:\n{policy_context}\n\nQuestion: {contextual_question}"),
                 ]).content
 
@@ -3550,25 +3737,885 @@ def _build_policy_lookup_draft(
     return "I couldn't find that policy information. Please rephrase your question or check the Penn State website directly.", tools_used, metadata
 
 
+def _build_semester_specific_major_draft(
+    user_question: str,
+    target: Dict[str, Any],
+    conversation_history: Optional[List[dict]],
+    has_transcript_for_plan: bool,
+    trace: Optional[Dict[str, Any]],
+    allowed_tools: Optional[set],
+    user_id: str = "default",
+) -> Tuple[str, List[str], Dict[str, Any]]:
+    """Generate the concrete courses for a specific target semester of a major.
+
+    Behavior contract (matches the product requirement):
+      - No transcript uploaded: return the courses that appear in the standard
+        graduation plan for that semester of the major/option. 15 credits,
+        deterministic (driven by ``generate_plan_from_major_and_year`` which
+        uses the course graph + CSV requirements, not the LLM).
+      - Transcript uploaded: return a personalized recommendation for the
+        student's next semester based on what they still need to satisfy
+        (delegated to ``aggregate_and_generate_response``).
+    """
+    target_semester = int(target.get("semester_number") or 0)
+    year_level = target.get("year_level") or "freshman"
+    horizon = max(1, int(target.get("horizon") or 1))
+
+    if has_transcript_for_plan:
+        try:
+            full_plan_text = aggregate_and_generate_response(user_question)
+            tools_used = ["transcript_state", "deterministic_planner"]
+            sliced = _slice_semester_plan_text(full_plan_text, horizon) or full_plan_text
+            return sliced, tools_used, {
+                "source": "personalized_semester_plan",
+                "target_semester": target_semester,
+                "horizon": horizon,
+            }
+        except Exception as e:
+            print(f"⚠️ Personalized semester-specific plan failed: {e}")
+
+    major_from_text, _year_from_text = _extract_major_year_from_request_context(
+        user_question, conversation_history
+    )
+    if not major_from_text:
+        return "", [], {"source": "semester_specific_missing_major"}
+
+    try:
+        full_plan_text = generate_plan_from_major_and_year(major_from_text, year_level)
+    except Exception as e:
+        print(f"⚠️ Deterministic semester-specific plan failed: {e}")
+        return "", [], {"source": "semester_specific_planner_failed", "error": str(e)}
+
+    if not full_plan_text or full_plan_text.startswith("I couldn't"):
+        return full_plan_text or "", [], {
+            "source": "semester_specific_no_plan",
+            "major": major_from_text,
+            "year_level": year_level,
+        }
+
+    tools_used = ["deterministic_planner"]
+    if horizon == 1:
+        block = _extract_semester_block_by_number(full_plan_text, target_semester)
+        if block:
+            return block, tools_used, {
+                "source": "major_year_semester_plan",
+                "target_semester": target_semester,
+                "major": major_from_text,
+                "year_level": year_level,
+                "horizon": 1,
+            }
+
+    sliced = _slice_semester_plan_text(full_plan_text, horizon) or full_plan_text
+    return sliced, tools_used, {
+        "source": "major_year_semester_plan",
+        "target_semester": target_semester,
+        "major": major_from_text,
+        "year_level": year_level,
+        "horizon": horizon,
+    }
+
+
+# =============================================================================
+# Executor tool registry — single source of truth for "data retrieval as a tool"
+#
+# The orchestrator now produces a ``retrieval_plan`` (an ordered list of
+# {tool, query, reason} steps). The executor stops deciding which tools to
+# call on its own; it dispatches every step through this registry. Each
+# callable takes a query string plus a context dict and returns formatted
+# retrieval text (empty string if nothing was found). Errors are swallowed
+# inside each wrapper so a failing tool never crashes the dispatcher.
+# =============================================================================
+
+
+def _call_majors_retriever(query: str, ctx: Dict[str, Any]) -> str:
+    if majors_retriever is None:
+        # #region debug log (H-R1: retriever None-state)
+        _dbg("H-R1", "main_copy.py:_call_majors_retriever", "retriever is None", {
+            "query_first_120": (query or "")[:120],
+        })
+        # #endregion
+        return ""
+    try:
+        docs = majors_retriever.invoke(query)
+    except Exception as e:
+        # #region debug log (H-R2: retriever exception)
+        _dbg("H-R2", "main_copy.py:_call_majors_retriever", "exception", {
+            "query_first_120": (query or "")[:120],
+            "error_type": type(e).__name__,
+            "error_str": str(e)[:300],
+        })
+        # #endregion
+        print(f"⚠️ majors_retriever failed: {e}")
+        return ""
+    # #region debug log (H-R3: docs returned)
+    _dbg("H-R3", "main_copy.py:_call_majors_retriever", "docs returned", {
+        "query_first_120": (query or "")[:120],
+        "docs_count": len(docs or []),
+        "docs_sizes": [len(getattr(d, "page_content", "") or "") for d in (docs or [])[:6]],
+        "doc0_head_200": ((docs[0].page_content or "") if docs else "")[:200],
+    })
+    # #endregion
+    if not docs:
+        return ""
+    return "\n\n".join(doc.page_content[:1200] for doc in docs[:4])
+
+
+def _call_course_retriever(query: str, ctx: Dict[str, Any]) -> str:
+    if course_retriever is None:
+        # #region debug log (H-R1: retriever None-state)
+        _dbg("H-R1", "main_copy.py:_call_course_retriever", "retriever is None", {
+            "query_first_120": (query or "")[:120],
+        })
+        # #endregion
+        return ""
+    try:
+        expanded = _expand_academic_query_terms(query)
+        docs = course_retriever.invoke(expanded)
+    except Exception as e:
+        # #region debug log (H-R2: retriever exception)
+        _dbg("H-R2", "main_copy.py:_call_course_retriever", "exception", {
+            "query_first_120": (query or "")[:120],
+            "expanded_first_120": (expanded if 'expanded' in locals() else "")[:120],
+            "error_type": type(e).__name__,
+            "error_str": str(e)[:300],
+        })
+        # #endregion
+        print(f"⚠️ course_retriever failed: {e}")
+        return ""
+    # #region debug log (H-R3: docs returned)
+    _dbg("H-R3", "main_copy.py:_call_course_retriever", "docs returned", {
+        "query_first_120": (query or "")[:120],
+        "expanded_first_120": (expanded or "")[:120],
+        "docs_count": len(docs or []),
+        "docs_sizes": [len(getattr(d, "page_content", "") or "") for d in (docs or [])[:8]],
+        "doc0_head_200": ((docs[0].page_content or "") if docs else "")[:200],
+    })
+    # #endregion
+    if not docs:
+        return ""
+    return "\n\n".join(doc.page_content[:700] for doc in docs[:8])
+
+
+def _call_prerequisite_graph(query: str, ctx: Dict[str, Any]) -> str:
+    """Look up enrollment + concurrent prereqs for every course code in the query.
+
+    The planner's query is expected to be a comma-separated or whitespace list
+    of candidate course codes (e.g. "CMPSC 131,CMPSC 132,MATH 140"). We extract
+    every PSU-style code and call the underlying graph for each. The output
+    format mirrors ``get_course_prerequisites`` so the synthesizer (and the
+    deterministic prereq validator) can parse it predictably.
+    """
+    if course_graph is None:
+        return ""
+    # 1-3 digit numbers with optional single-letter suffix to cover the full
+    # PSU catalog shape (SOC 1, ART 11, MATH 21, ENGL 15, CMPSC 131, ART 122Y).
+    codes = re.findall(r"\b([A-Z]{2,})\s+(\d{1,3}[A-Z]?)\b", query, flags=re.IGNORECASE)
+    if not codes:
+        return ""
+    seen: List[str] = []
+    parts: List[str] = []
+    for prefix, number in codes:
+        code = f"{prefix.upper()} {number}"
+        if code in seen:
+            continue
+        seen.append(code)
+        try:
+            text = get_course_prerequisites(code, course_graph)
+        except Exception as e:
+            print(f"⚠️ prerequisite_graph failed for {code}: {e}")
+            continue
+        if text:
+            parts.append(text.strip())
+    return "\n\n".join(parts)
+
+
+def _call_policy_retriever(query: str, ctx: Dict[str, Any]) -> str:
+    if policy_retriever is None:
+        return ""
+    try:
+        docs = policy_retriever.invoke(query)
+    except Exception as e:
+        print(f"⚠️ policy_retriever failed: {e}")
+        return ""
+    if not docs:
+        return ""
+    return "\n\n".join(doc.page_content[:900] for doc in docs[:4])
+
+
+def _call_web_search(query: str, ctx: Dict[str, Any]) -> str:
+    user_id = str(ctx.get("user_id") or "default")
+    trace = ctx.get("trace")
+    try:
+        result = _run_shared_search_pipeline(
+            user_id=user_id,
+            question_text=query,
+            conversation_history=None,
+            trace=trace,
+            preferred_strategy="generic_authoritative_lookup",
+            preferred_domains=["abington.psu.edu", "psu.edu", "pennstate.edu"],
+            required_domain_mode="preferred",
+        )
+    except Exception as e:
+        print(f"⚠️ web_search failed: {e}")
+        return ""
+    return _research_answer_text(result) or ""
+
+
+# Registry keyed by the same tool names the orchestrator uses in
+# ``allowed_tools`` and ``retrieval_plan``. Adding a new tool is a one-line
+# change here plus an entry in ``_TOOLS_BY_PATH``.
+EXECUTOR_TOOLS: Dict[str, Callable[[str, Dict[str, Any]], str]] = {
+    "majors_retriever":    _call_majors_retriever,
+    "course_retriever":    _call_course_retriever,
+    "prerequisite_graph":  _call_prerequisite_graph,
+    "policy_retriever":    _call_policy_retriever,
+    "web_search":          _call_web_search,
+}
+
+
+# PSU course numbers are 2-3 digits with an optional single-letter suffix
+# (e.g. ART 11, MATH 21, ENGL 15, CMPSC 131, ENGL 202D, ART 122Y). Older
+# regexes in this file require exactly 3 digits, which silently drops every
+# 2-digit code and is part of the reason the user's Art + Accounting plan
+# could not retrieve prereqs for ART 11. We also accept 1-digit PSU codes
+# (SOC 1, CAS 1, ART 1) — confirmed by runtime logs from the Psych double
+# major, where "SOC 1" escaped both the rewrite and the backfill scan.
+_COURSE_CODE_FINDER = re.compile(r"\b([A-Z]{2,})\s+(\d{1,3}[A-Z]?)\b")
+_PREREQ_HEADER_FINDER = re.compile(
+    r"Prerequisites for\s+([A-Z]{2,})\s+(\d{1,3}[A-Z]?)\s*:", re.IGNORECASE
+)
+_PREREQ_NOT_FOUND_FINDER = re.compile(
+    r"No course named '\s*([A-Z]{2,})\s+(\d{1,3}[A-Z]?)\s*' found\.", re.IGNORECASE
+)
+
+
+def _normalize_course_code(prefix: str, number: str) -> str:
+    return f"{prefix.upper().strip()} {number.upper().strip()}"
+
+
+def _collect_codes_from_text(text: str) -> List[str]:
+    """Return every PSU-style course code found in ``text`` (deduped, ordered)."""
+    if not text:
+        return []
+    seen: Dict[str, None] = {}  # ordered set
+    for prefix, number in _COURSE_CODE_FINDER.findall(text):
+        seen[_normalize_course_code(prefix, number)] = None
+    return list(seen.keys())
+
+
+def _collect_codes_already_attempted(prereq_text: str) -> set:
+    """Course codes the prereq_graph already TRIED to look up.
+
+    A code counts as "attempted" if either:
+      - the bundle contains a ``Prerequisites for X:`` header for it (success), or
+      - the bundle contains a ``No course named 'X' found.`` line for it (tried-and-empty).
+
+    Both shapes mean the executor already asked the graph about that code, so
+    a follow-up retrieval would just repeat the same call. The backfill pass
+    only targets codes that have been NEITHER attempted nor returned.
+    """
+    attempted: set = set()
+    if not prereq_text:
+        return attempted
+    for prefix, number in _PREREQ_HEADER_FINDER.findall(prereq_text):
+        attempted.add(_normalize_course_code(prefix, number))
+    for prefix, number in _PREREQ_NOT_FOUND_FINDER.findall(prereq_text):
+        attempted.add(_normalize_course_code(prefix, number))
+    return attempted
+
+
+def _backfill_missing_prereqs(
+    bundle: Dict[str, Dict[str, str]],
+    plan: OrchestrationPlan,
+    ctx: Dict[str, Any],
+    tools_used: List[str],
+) -> None:
+    """Self-consistency pass: backfill prereq retrieval for every course in
+    the bundle that doesn't yet have a prereq entry.
+
+    Why this exists: a planner can be lazy and only enumerate a handful of
+    course codes in its ``prerequisite_graph`` step. The bundle that comes
+    back will then have ``majors_retriever`` results listing dozens of
+    courses while ``prerequisite_graph`` only covered six. Without this
+    pass the synthesizer is forced to write ``(prerequisites: not retrieved)``
+    on every uncovered course — which is exactly the bug the user reported
+    on the Art + Accounting double-major plan.
+
+    The pass is intentionally generic: it does NOT know anything about Art
+    or Accounting or which majors the planner picked. It just enforces the
+    bundle invariant "every course code we mention should also have a
+    prereq lookup attempt", which is the universal contract the synthesizer
+    relies on. Mutates ``bundle`` and ``tools_used`` in place.
+    """
+    if "prerequisite_graph" not in EXECUTOR_TOOLS:
+        return
+    if plan.allowed_tools and "prerequisite_graph" not in plan.allowed_tools:
+        return
+    callable_ = EXECUTOR_TOOLS.get("prerequisite_graph")
+    if callable_ is None:
+        return
+
+    # Collect every code the bundle mentions across ALL tools.
+    mentioned: Dict[str, None] = {}
+    for payload in bundle.values():
+        for code in _collect_codes_from_text(payload.get("results", "") or ""):
+            mentioned[code] = None
+    if not mentioned:
+        return
+
+    existing_prereq_text = ""
+    if "prerequisite_graph" in bundle:
+        existing_prereq_text = bundle["prerequisite_graph"].get("results", "") or ""
+    attempted = _collect_codes_already_attempted(existing_prereq_text)
+
+    # Anything we've never asked the graph about needs a follow-up call.
+    missing = [code for code in mentioned if code not in attempted]
+    # #region debug log (H-B3: backfill scope)
+    _dbg("H-B3", "main_copy.py:_backfill_missing_prereqs", "scope", {
+        "mentioned_count": len(mentioned),
+        "mentioned_sample": list(mentioned.keys())[:30],
+        "attempted_count": len(attempted),
+        "attempted_sample": list(attempted)[:30],
+        "missing_count": len(missing),
+        "missing_sample": missing[:30],
+    })
+    # #endregion
+    if not missing:
+        return
+
+    # Chunk the lookup so a single huge query string never blows past
+    # tokenizer limits. 25 codes per call is well under any reasonable cap.
+    new_chunks: List[str] = []
+    for i in range(0, len(missing), 25):
+        chunk = missing[i:i + 25]
+        query = ", ".join(chunk)
+        try:
+            chunk_text = callable_(query, ctx) or ""
+        except Exception as e:  # pragma: no cover - tool wrapper already swallows
+            print(f"⚠️ prereq backfill failed for chunk {i}: {e}")
+            continue
+        if chunk_text:
+            new_chunks.append(chunk_text)
+
+    if not new_chunks:
+        return
+    backfill_text = "\n\n".join(new_chunks)
+
+    if "prerequisite_graph" in bundle:
+        bundle["prerequisite_graph"]["results"] = (
+            (existing_prereq_text + "\n\n---\nAuto-backfill for codes the "
+             "planner did not pre-list:\n\n" + backfill_text).strip()
+        )
+        # Note in the reason that we extended the planner's query so the
+        # executor's metadata accurately reflects what was retrieved.
+        prior_reason = bundle["prerequisite_graph"].get("reason", "") or ""
+        bundle["prerequisite_graph"]["reason"] = (
+            (prior_reason + " (auto-extended to cover every code mentioned in the bundle)").strip()
+        )
+    else:
+        bundle["prerequisite_graph"] = {
+            "query": "auto-backfill: " + ", ".join(missing[:25]) + (
+                f" (and {len(missing) - 25} more)" if len(missing) > 25 else ""
+            ),
+            "reason": (
+                "Bundle self-consistency: every course mentioned in the bundle must have "
+                "a prereq lookup attempt before synthesis."
+            ),
+            "results": backfill_text,
+        }
+        if "prerequisite_graph" not in tools_used:
+            tools_used.append("prerequisite_graph")
+
+
+# Match the WHOLE inline prereq parenthetical so we can replace it as a unit.
+# Accepts "(prerequisites: ...)", "(prereq: ...)", "(prereqs: ...)", etc.
+_INLINE_PREREQ_REPLACE_RE = re.compile(
+    r"\(\s*prereq(?:uisite)?s?\s*:\s*[^)]*\)",
+    re.IGNORECASE,
+)
+
+# Match a single "Prerequisites for X:" block in the graph output, capturing
+# the raw body (everything until the next header or end-of-text). We preserve
+# the body VERBATIM rather than re-parsing it into codes — the parser silently
+# drops 2-digit codes (e.g., "Math 22" in MATH 140's prereq), which is
+# exactly what made the LLM say "(prerequisites: None)" for MATH 140.
+_PREREQ_BLOCK_HEADER_RE = re.compile(
+    r"Prerequisites for\s+([A-Z]{2,})\s+(\d{1,3}[A-Z]?)\s*:?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ENFORCED_PREREQ_LINE_RE = re.compile(
+    r"-\s*Enforced prerequisite at enrollment\s*:\s*(.*?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_raw_enforced_prereq_map(prereq_graph_text: str) -> Dict[str, str]:
+    """Return ``{COURSE_CODE: raw enforced-prereq text}`` from the graph.
+
+    Unlike :func:`_parse_prereq_graph_text` (which extracts codes only and
+    silently drops 2-digit prereqs), this preserves the verbatim text from
+    the "Enforced prerequisite at enrollment:" line. That's what we hand to
+    the rewrite — accurate verbose text beats concise wrong text every
+    time.
+    """
+    result: Dict[str, str] = {}
+    if not prereq_graph_text:
+        return result
+    headers = list(_PREREQ_BLOCK_HEADER_RE.finditer(prereq_graph_text))
+    for idx, hm in enumerate(headers):
+        code = _normalize_course_code(hm.group(1), hm.group(2))
+        body_start = hm.end()
+        body_end = headers[idx + 1].start() if idx + 1 < len(headers) else len(prereq_graph_text)
+        body = prereq_graph_text[body_start:body_end]
+        em = _ENFORCED_PREREQ_LINE_RE.search(body)
+        if em:
+            payload = em.group(1).strip()
+        else:
+            payload = "None"
+        result[code] = payload or "None"
+    return result
+
+
+def _rewrite_inline_prereqs_from_graph(
+    response_text: str,
+    prereq_graph_text: str,
+) -> str:
+    """Overwrite every '(prerequisites: ...)' annotation with verified text
+    from the prereq graph.
+
+    Why this exists: the synthesizer LLM is the wrong tool for transcribing
+    prereq lists. Given a wall of graph data, it routinely either drops a
+    real prereq (writes 'None' for MATH 140) or upgrades a 'concurrent'
+    option to a fake enforced prereq (writes 'ARTH 250' for PHOTO 201). A
+    short deterministic rewrite eliminates both failure modes — we let the
+    LLM keep writing the annotation in its preferred shape, then replace
+    the parenthetical contents with the truth from the graph before
+    shipping.
+
+    For each line that already carries an inline '(prerequisites: ...)':
+      * Find the FIRST course code on the line that's known to the graph
+        (this is the course being recommended; codes after 'examples:' on
+        categorized placeholder lines are sample picks, not recommendations).
+      * Replace the parenthetical with the verbatim "Enforced prerequisite
+        at enrollment" text from the graph, or "(prerequisites: None)" when
+        the graph says None.
+      * Lines whose course is not in the graph are left untouched.
+    """
+    if not response_text or not prereq_graph_text:
+        # #region debug log (H-B1: rewrite no-op early)
+        _dbg("H-B1", "main_copy.py:_rewrite_inline_prereqs_from_graph", "early-exit empty input", {
+            "response_len": len(response_text or ""),
+            "graph_text_len": len(prereq_graph_text or ""),
+        })
+        # #endregion
+        return response_text
+    raw_map = _extract_raw_enforced_prereq_map(prereq_graph_text)
+    # #region debug log (H-B1+H-B2: extracted graph map)
+    _dbg("H-B1+H-B2", "main_copy.py:_rewrite_inline_prereqs_from_graph", "extracted raw_map", {
+        "map_size": len(raw_map),
+        "map_keys_sample": list(raw_map.keys())[:40],
+        "graph_text_len": len(prereq_graph_text or ""),
+    })
+    # #endregion
+    if not raw_map:
+        return response_text
+
+    skipped: List[Dict[str, Any]] = []
+
+    def fix_line(line: str) -> str:
+        if not _INLINE_PREREQ_REPLACE_RE.search(line):
+            return line
+        codes = _COURSE_CODE_FINDER.findall(line)
+        payload: Optional[str] = None
+        normalized_codes: List[str] = []
+        for prefix, number in codes:
+            up = _normalize_course_code(prefix, number)
+            normalized_codes.append(up)
+            if up in raw_map:
+                payload = raw_map[up]
+                break
+        if payload is None:
+            skipped.append({
+                "line_first_200": line.strip()[:200],
+                "codes_on_line": normalized_codes,
+            })
+            return line
+        clean = payload.strip().rstrip(".")
+        if clean.lower() in {"", "none"}:
+            new_annotation = "(prerequisites: None)"
+        else:
+            new_annotation = f"(prerequisites: {clean})"
+        return _INLINE_PREREQ_REPLACE_RE.sub(new_annotation, line, count=1)
+
+    out = "\n".join(fix_line(line) for line in response_text.splitlines())
+    # #region debug log (H-B2: lines the rewrite couldn't fix)
+    _dbg("H-B1+H-B2", "main_copy.py:_rewrite_inline_prereqs_from_graph", "lines skipped (no map hit)", {
+        "skipped_count": len(skipped),
+        "skipped_sample": skipped[:15],
+    })
+    # #endregion
+    return out
+
+
+def _execute_retrieval_plan(
+    plan: OrchestrationPlan,
+    trace: Optional[Dict[str, Any]] = None,
+    user_id: str = "default",
+) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+    """Dispatch every step in ``plan.retrieval_plan`` through ``EXECUTOR_TOOLS``.
+
+    Returns a labeled bundle keyed by tool name and the list of tools that
+    actually returned content (this becomes ``tools_used`` for downstream
+    validation). If the planner lists the same tool twice, the second call's
+    output is concatenated with a separator so both queries' results survive.
+
+    After the planner-defined steps complete, a structural self-consistency
+    pass (``_backfill_missing_prereqs``) makes one final ``prerequisite_graph``
+    call covering every course code the bundle mentions but the planner's
+    prereq query missed. This is what stops the synthesizer from writing
+    ``(prerequisites: not retrieved)`` on courses it actually could have
+    looked up.
+    """
+    bundle: Dict[str, Dict[str, str]] = {}
+    tools_used: List[str] = []
+    if not plan.retrieval_plan:
+        return bundle, tools_used
+
+    ctx: Dict[str, Any] = {"user_id": user_id, "trace": trace, "plan": plan}
+    # #region debug log (H-A1: per-step retrieval contract)
+    _dbg("H-A1+H-B1", "main_copy.py:_execute_retrieval_plan", "plan steps about to execute", {
+        "plan_majors": list(getattr(plan, "majors", None) or []),
+        "step_count": len(plan.retrieval_plan or []),
+        "steps": [
+            {"tool": str(s.get("tool", "")), "query": str(s.get("query", ""))[:120]}
+            for s in (plan.retrieval_plan or [])
+        ],
+    })
+    # #endregion
+    for step in plan.retrieval_plan:
+        tool = str(step.get("tool", "")).strip()
+        query = str(step.get("query", "")).strip()
+        reason = str(step.get("reason", "")).strip()
+        if not tool or not query:
+            continue
+        if plan.allowed_tools and tool not in plan.allowed_tools:
+            continue
+        callable_ = EXECUTOR_TOOLS.get(tool)
+        if callable_ is None:
+            continue
+        results = callable_(query, ctx) or ""
+        # #region debug log (H-B1: per-tool result size)
+        _dbg("H-A1+H-B1", "main_copy.py:_execute_retrieval_plan", "tool returned", {
+            "tool": tool,
+            "query_first_120": query[:120],
+            "result_len": len(results or ""),
+            "result_head_300": (results or "")[:300],
+        })
+        # #endregion
+        if not results:
+            continue
+        if tool in bundle:
+            bundle[tool]["query"] = bundle[tool]["query"] + " | " + query
+            bundle[tool]["reason"] = bundle[tool]["reason"] or reason
+            bundle[tool]["results"] = bundle[tool]["results"] + "\n\n---\n\n" + results
+        else:
+            bundle[tool] = {"query": query, "reason": reason, "results": results}
+            tools_used.append(tool)
+
+    # Bundle self-consistency: the planner's prereq step is allowed to be
+    # narrow ("ART 11, ART 110, ART 111, ART 122, ACCTG 211, ACCTG 212") even
+    # though the actual bundle ends up mentioning 30+ codes. We backfill so
+    # every recommendable course has a prereq attempt before synthesis.
+    if _is_course_recommendation_deliverable(plan):
+        _backfill_missing_prereqs(bundle, plan, ctx, tools_used)
+    return bundle, tools_used
+
+
+def _format_retrieval_bundle_for_prompt(bundle: Dict[str, Dict[str, str]]) -> str:
+    """Render the bundle as labeled sections the synthesis LLM can read.
+
+    Each section is clearly headed by tool name so the model — and the tests —
+    can verify which tool produced which evidence."""
+    if not bundle:
+        return "(no retrieval results available)"
+    lines: List[str] = []
+    for tool, payload in bundle.items():
+        lines.append(f"### {tool}")
+        if payload.get("reason"):
+            lines.append(f"_reason_: {payload['reason']}")
+        lines.append(f"_query_: {payload.get('query', '')}")
+        lines.append("")
+        lines.append((payload.get("results") or "").strip())
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _multi_major_rule_block(plan: Optional["OrchestrationPlan"]) -> str:
+    """Inject the MULTI-MAJOR RULE into the synthesis prompt when applicable.
+
+    Returns an empty string for single-major (or unknown-major) plans so the
+    rest of the prompt is unchanged. For double/multi-major plans it lists
+    every requested major and tells the synthesizer it MUST cover required
+    courses from each, label which course belongs to which major, and call
+    out shared / double-counting courses explicitly.
+    """
+    majors = list(getattr(plan, "majors", None) or []) if plan is not None else []
+    if len(majors) <= 1:
+        return ""
+    listed = ", ".join(majors)
+    return (
+        "MULTI-MAJOR RULE (enforced; the response will be re-tried if violated):\n"
+        f"The student is pursuing {len(majors)} majors: {listed}. The response MUST "
+        "include required courses from EACH of those majors. For every course you "
+        "schedule, label which major it serves (e.g. '[Art]', '[Accounting]', or "
+        "'[Shared/double-counts]' for a course that satisfies a requirement for "
+        "more than one major). Identify shared/double-counting courses explicitly so "
+        "the student understands when a single course knocks out two requirements. "
+        "Pull the requirements for each major from its dedicated section in the "
+        "verified data below. Do NOT ship a single-major plan in response to a "
+        "multi-major request.\n\n"
+    )
+
+
 def _build_major_lookup_draft(
     user_question: str,
     trace: Optional[Dict[str, Any]],
     allowed_tools: Optional[set] = None,
     user_id: str = "default",
+    plan: Optional[OrchestrationPlan] = None,
+    retry_reason: Optional[str] = None,
 ) -> Tuple[str, List[str], Dict[str, Any]]:
-    if (allowed_tools is None or "majors_retriever" in allowed_tools) and majors_retriever:
+    """Major-lookup executor: planner-driven retrieval + bundle-grounded synthesis.
+
+    Control flow:
+      1. Dispatch every step in ``plan.retrieval_plan`` through ``EXECUTOR_TOOLS``.
+         If the planner left it empty (or no plan was passed), fall back to the
+         canonical major-lookup retrieval set so we never silently skip a tool.
+      2. If retrieval returned anything, synthesize a single grounded answer
+         using ADVISOR_PERSONA + the labeled bundle + the planner's
+         ``synthesis_brief``. The synthesizer is told which tool produced
+         which evidence and is required to schedule courses only when the
+         ``prerequisite_graph`` section confirms prereqs are satisfied.
+      3. If retrieval came back completely empty, escalate to web_search.
+      4. If even web_search has nothing, return a warm soft-ask asking the
+         student to confirm the major name.
+    """
+    bundle: Dict[str, Dict[str, str]] = {}
+    tools_used: List[str] = []
+
+    if plan is not None and plan.retrieval_plan:
+        bundle, tools_used = _execute_retrieval_plan(plan, trace=trace, user_id=user_id)
+
+    if not bundle:
+        # Safety net: planner produced no retrieval_plan AND no override step
+        # populated it (e.g. degraded retrievers). Run the canonical major-lookup
+        # fan-out directly through the registry so we never reach synthesis with
+        # an empty bundle.
+        ctx = {"user_id": user_id, "trace": trace, "plan": plan}
+        for tool in ("majors_retriever", "course_retriever", "prerequisite_graph"):
+            if allowed_tools is not None and tool not in allowed_tools:
+                continue
+            callable_ = EXECUTOR_TOOLS.get(tool)
+            if callable_ is None:
+                continue
+            results = callable_(user_question, ctx) or ""
+            if results:
+                bundle[tool] = {
+                    "query": user_question,
+                    "reason": "Canonical retrieval fallback (planner did not provide a step).",
+                    "results": results,
+                }
+                tools_used.append(tool)
+
+    if bundle:
+        synthesis_brief = (plan.synthesis_brief if plan is not None else "") or (
+            "Build a grounded answer to the student's question using ONLY the verified data shown below. "
+            "If they asked for a single semester, return exactly one Semester N: ... Total Credits: N block."
+        )
+        retry_directive = ""
+        if retry_reason == "prerequisite_violation":
+            retry_directive = (
+                "\n\nIMPORTANT RETRY: The previous attempt scheduled a course whose enrollment "
+                "prerequisite was not satisfied in an earlier semester. Re-read the prerequisite_graph "
+                "section carefully. For every course you place in Semester N, every code listed under "
+                "'Enforced prerequisite at enrollment' MUST appear in some Semester < N of your response, "
+                "OR be listed under 'Enforced concurrent at enrollment' (meaning it can be in the same "
+                "semester). If you cannot satisfy a prereq, swap the course out for one whose prereqs are "
+                "satisfied. Do not repeat the previous violation."
+            )
+        elif retry_reason == "under_specified_recommendation":
+            retry_directive = (
+                "\n\nIMPORTANT RETRY: The previous attempt left a slot in a semester block as a bare "
+                "placeholder like 'Elective', 'Gen Ed', or 'Option Course'. The student cannot register "
+                "for that — every line in a Semester N: ... block MUST be one of:\n"
+                "  (a) A specific course code with title pulled from the bundle "
+                "(e.g. 'BIOL 110: Biology Concepts and Biodiversity').\n"
+                "  (b) A categorized placeholder of the form "
+                "'<Tag/Category>: <Bucket name> elective — examples: <CODE 1>, <CODE 2>'. "
+                "Use the actual taxonomy that appears in the majors_retriever section "
+                "(GH, GA, GS, GN, GQ, GHW, GWS, US, IL, humanities, social science, "
+                "natural science, arts, quantification, etc.) and pull example codes "
+                "from the course_retriever section. If you know the bucket category at all "
+                "(humanities, writing/speaking, social science, etc.) you MUST use this form. "
+                "Form (c) is a last resort.\n"
+                "  (c) An honest deferral RESERVED for slots whose bucket category is genuinely "
+                "unknown: 'Open slot — we don't have a category for this slot yet; "
+                "please confirm with your advisor.'\n"
+                "Do not repeat the previous bare-placeholder lines."
+            )
+        elif retry_reason == "missing_inline_prereqs":
+            retry_directive = (
+                "\n\nIMPORTANT RETRY: The previous attempt recommended one or more courses "
+                "in a 'Semester N:' block without showing their prerequisites on the same "
+                "line. Every line inside a semester block that contains a course code MUST "
+                "end with '(prerequisites: <list>)' or '(prerequisites: None)'. Use the "
+                "prereq data shown in the verified data below. If a course's prereqs are "
+                "genuinely not in the verified data, DROP that course from the semester "
+                "block and replace it with one whose prereqs are known; do NOT write "
+                "'(prerequisites: not retrieved)' or any similar placeholder — students "
+                "find that confusing. Prose references to courses outside semester blocks "
+                "do not need prereq annotations."
+            )
+        elif retry_reason == "missing_major_coverage":
+            requested_majors = ", ".join(getattr(plan, "majors", None) or []) or "(unspecified)"
+            retry_directive = (
+                "\n\nIMPORTANT RETRY: The previous attempt did not cover every major the "
+                f"student asked about. The requested majors are: {requested_majors}. The "
+                "response MUST mention each of these majors by name and include required "
+                "courses from EACH of them. Label every course with the major it serves "
+                "(e.g. '[Art]', '[Accounting]', '[Shared/double-counts]'). Pull each "
+                "major's requirements from its dedicated section in the verified data "
+                "below. Do not repeat the previous single-major answer."
+            )
+        system_content = (
+            ADVISOR_PERSONA
+            + "\n\nFor this turn you are the major-lookup synthesizer. You receive verified "
+            "Penn State data below, organized into labeled sections. Ground every Penn State-specific "
+            "claim in that data. Use exact course codes and titles as they appear there.\n\n"
+            "USER-FACING LANGUAGE RULE: never use internal terms in your answer. The student does not "
+            "know what the following words mean and must NOT see them: 'retrieved bundle', 'retrieval', "
+            "'retrieved', 'bundle', 'majors_retriever', 'course_retriever', 'prerequisite_graph', "
+            "'planner', 'executor', 'synthesizer'. If a piece of information isn't in the data below, "
+            "just say so in plain student-facing language (e.g., 'this isn't in our course data' or "
+            "'you'll want to confirm this with an advisor').\n\n"
+            "PREREQUISITE RULES (enforced; the response will be re-tried if violated):\n"
+            "- Every course you place in Semester N must have its 'Enforced prerequisite at enrollment' "
+            "satisfied by a course scheduled in some Semester < N of THIS SAME response, OR appear in "
+            "'Enforced concurrent at enrollment' (which permits the prereq and the course in the same "
+            "semester).\n"
+            "- For a first-semester / freshman recommendation, only schedule courses whose 'Enforced "
+            "prerequisite at enrollment' is None (placement tests and high-school background do not "
+            "count as college-level prereqs).\n"
+            "- If the verified data has no prereq entry for a course you want to recommend, do NOT "
+            "recommend it. Say so explicitly.\n\n"
+            "INLINE PREREQUISITE ANNOTATION RULE (enforced; the response will be re-tried if violated):\n"
+            "Every line that contains a course code inside a 'Semester N: ... Total Credits: N' block "
+            "MUST end with a parenthetical of the form '(prerequisites: <list>)'. Always include the "
+            "annotation — the system rewrites the contents from verified data before shipping, so just "
+            "make sure each course line has the parenthetical present. Example shape:\n"
+            "  'CMPSC 132: Programming and Computation II (prerequisites: CMPSC 131)'\n"
+            "  'MATH 140: Calculus I (prerequisites: None)'\n"
+            "This is required for every course recommendation; the student needs to see what each "
+            "course requires before they can register.\n\n"
+            "RECOMMENDATION SPECIFICITY RULES (enforced; the response will be re-tried if violated):\n"
+            "Every line inside a 'Semester N: ... Total Credits: N' block MUST be one of:\n"
+            "  (a) A specific course code with title, followed by the inline prereq annotation "
+            "(see rule above).\n"
+            "  (b) A clearly categorized placeholder using the actual gen-ed taxonomy. The line MUST "
+            "contain at least one of:\n"
+            "      - A gen-ed/program tag: GH, GA, GS, GN, GQ, GHW, GWS, US, IL, GFL.\n"
+            "      - A category word: humanities, social science, natural science, arts, quantification, "
+            "health and wellness, writing, speaking, cultural diversity, US cultures, international cultures, "
+            "foreign language, capstone, honors, seminar.\n"
+            "      Whenever possible, append concrete example course codes using the form "
+            "'— examples: CODE 1, CODE 2, CODE 3'.\n"
+            "      If you can identify the bucket category AT ALL — even just 'humanities' or "
+            "'writing/speaking' — you MUST use this form (b). Do NOT fall back to form (c).\n"
+                "  (c) An honest deferral RESERVED for slots whose bucket category is genuinely "
+                "unknown: 'Open slot — we don't have a category for this slot yet; please confirm "
+                "with your advisor.' Do not use this form when you already know the bucket (e.g. "
+                "'humanities slot', 'writing/speaking slot') — that is form (b) territory and "
+                "apologizing is the wrong move.\n"
+            "NEVER write a bare 'Elective', 'Gen Ed', 'General Education', 'Option Course', "
+            "'Major Elective', or 'Free Elective' line. Those are not actionable for the student and the "
+            "validator will reject the response.\n\n"
+            + _multi_major_rule_block(plan)
+            +             "Other rules:\n"
+            "- Prefer a realistic 15-17 credit load unless the question asks otherwise.\n"
+            "- If the user asked for a single semester, return exactly one Semester N: ... Total Credits: N block.\n"
+            "- If the user asked for multiple semesters, structure your answer semester by semester.\n"
+            "- If the verified data does not contain enough information to answer, say so explicitly "
+            "and list what is missing in plain language (e.g. 'prereq info for X isn't in our records'). "
+            "Do not hallucinate course codes or titles."
+            + retry_directive
+        )
+        human_content = (
+            f"Question: {user_question}\n\n"
+            f"Brief:\n{synthesis_brief}\n\n"
+            f"Verified Penn State data:\n{_format_retrieval_bundle_for_prompt(bundle)}"
+        )
         try:
-            major_docs = majors_retriever.invoke(user_question)
-            if major_docs:
-                major_context = "\n\n".join(doc.page_content[:800] for doc in major_docs[:3])
-                response = llm2.invoke([
-                    SystemMessage(content="Answer the student's question using ONLY the provided major requirements context. If the answer is not present, say you could not find it in the local data."),
-                    HumanMessage(content=f"Major requirements context:\n{major_context}\n\nQuestion: {user_question}"),
-                ]).content
-                if not _response_indicates_no_answer_found(response):
-                    return response, ["majors_retriever"], {"source": "majors_retriever"}
+            response = llm2.invoke([
+                SystemMessage(content=system_content),
+                HumanMessage(content=human_content),
+            ]).content
+            if response and not _response_indicates_no_answer_found(response):
+                # Overwrite every '(prerequisites: ...)' annotation with the
+                # verified text from the prereq graph BEFORE the response is
+                # returned. The synthesizer LLM consistently misreads this
+                # data (writes 'None' for courses that have prereqs, or
+                # upgrades concurrent options to fake enforced prereqs);
+                # rewriting deterministically from the graph eliminates the
+                # entire class of false-info bugs in one pass.
+                prereq_text_for_rewrite = ""
+                if "prerequisite_graph" in bundle:
+                    prereq_text_for_rewrite = bundle["prerequisite_graph"].get("results", "") or ""
+                if prereq_text_for_rewrite:
+                    response = _rewrite_inline_prereqs_from_graph(response, prereq_text_for_rewrite)
+                # #region debug log (H-B1+H-B2: post-rewrite "not retrieved" survivors + multi-major surface)
+                _not_retrieved_lines = [
+                    ln.strip()[:200]
+                    for ln in (response or "").splitlines()
+                    if "prerequisites: not retrieved" in ln.lower()
+                ]
+                _resp_lower_dbg = (response or "").lower()
+                _dbg("H-A1+H-A3+H-B1+H-B2", "main_copy.py:_build_major_lookup_draft",
+                     "post-rewrite executor draft snapshot", {
+                    "response_len": len(response or ""),
+                    "not_retrieved_count": len(_not_retrieved_lines),
+                    "not_retrieved_sample": _not_retrieved_lines[:10],
+                    "mentions_history": "history" in _resp_lower_dbg,
+                    "mentions_computer_science": "computer science" in _resp_lower_dbg,
+                    "mentions_cs": " cs " in (" " + _resp_lower_dbg + " "),
+                    "plan_majors": list(getattr(plan, "majors", None) or []) if plan is not None else [],
+                    "deliverable": getattr(plan, "deliverable", None) if plan is not None else None,
+                    "executor_path": getattr(plan, "executor_path", None) if plan is not None else None,
+                    "tools_used": list(tools_used or []),
+                })
+                # #endregion
+                metadata: Dict[str, Any] = {
+                    "source": "major_lookup_rag",
+                    "retrieval_bundle": {
+                        tool: {
+                            "query": payload.get("query", ""),
+                            "reason": payload.get("reason", ""),
+                            "results_preview": (payload.get("results") or "")[:600],
+                        }
+                        for tool, payload in bundle.items()
+                    },
+                    "used_majors_retriever": "majors_retriever" in tools_used,
+                    "used_course_retriever": "course_retriever" in tools_used,
+                    "used_prerequisite_graph": "prerequisite_graph" in tools_used,
+                    "retry_reason": retry_reason,
+                }
+                # The prereq validator (orchestration_pipeline.validate_final_response)
+                # reads this full text to verify every recommended course's enrollment
+                # prereqs are satisfied in earlier semesters of the response.
+                if "prerequisite_graph" in bundle:
+                    metadata["prereq_graph_text"] = bundle["prerequisite_graph"].get("results", "")
+                return response, tools_used, metadata
         except Exception as e:
-            print(f"⚠️ Could not retrieve major information: {e}")
+            print(f"⚠️ major_lookup LLM synthesis failed: {e}")
 
     if allowed_tools is None or "web_search" in allowed_tools:
         search_result = _run_shared_search_pipeline(
@@ -3581,12 +4628,95 @@ def _build_major_lookup_draft(
             required_domain_mode="preferred",
         )
         web_response = _research_answer_text(search_result)
-        if web_response:
-            return web_response, ["web_search"], {
+        if web_response and _web_fallback_is_structurally_acceptable(web_response, plan):
+            return web_response, tools_used + ["web_search"], {
                 "source": "shared_search_pipeline",
                 **_resolved_search_to_metadata(search_result),
             }
-    return "I couldn't find that major's requirements. Please provide the exact major name.", [], {"source": "major_lookup_not_found"}
+        # Web search returned text, but it is structurally unacceptable for
+        # this deliverable (e.g. course-recommendation deliverable with no
+        # Semester N: ... Total Credits: N block and no course codes).
+        # Honest unknown beats confident garbage: fall through to the
+        # soft-ask below rather than ship the registrar-page prose.
+    return (
+        _major_lookup_soft_ask(plan, bundle),
+        tools_used,
+        {"source": "major_lookup_not_found"},
+    )
+
+
+def _is_course_recommendation_deliverable(plan: Optional["OrchestrationPlan"]) -> bool:
+    """True when the plan asked for an actual semester-by-semester course plan.
+
+    Used to gate the web-search fallback acceptance check: vague registrar
+    prose is fine for a "what is the Art major about" question but is NEVER
+    an acceptable answer to "give me a 4-semester plan".
+    """
+    if plan is None:
+        return False
+    scope = (getattr(plan, "plan_scope", "") or "").lower()
+    deliverable = (getattr(plan, "deliverable", "") or "").lower()
+    if scope in {"single_semester", "multi_semester", "full_graduation"}:
+        return True
+    if deliverable in {
+        "single_semester_plan",
+        "multi_semester_plan",
+        "full_graduation_plan",
+    }:
+        return True
+    return False
+
+
+def _web_fallback_is_structurally_acceptable(
+    response_text: str,
+    plan: Optional["OrchestrationPlan"],
+) -> bool:
+    """Structural acceptance check for the web_search fallback.
+
+    For course-recommendation deliverables the response MUST contain at
+    least one ``Semester N: ... Total Credits: N`` block AND at least one
+    course code. If both are missing, the web fallback is shipping vague
+    registrar prose instead of an actual plan and we reject it. (Trace 2.)
+
+    For any other deliverable (lookup, direct_answer, audit) we accept the
+    web response as-is since it is just being used as a fact-finding aid.
+    """
+    if not response_text:
+        return False
+    if not _is_course_recommendation_deliverable(plan):
+        return True
+    has_semester_block = bool(_extract_semester_blocks_from_text(response_text))
+    from orchestration_pipeline import COURSE_CODE_RE  # local import avoids cycles
+    has_course_code = bool(COURSE_CODE_RE.search(response_text))
+    return has_semester_block and has_course_code
+
+
+def _major_lookup_soft_ask(
+    plan: Optional["OrchestrationPlan"],
+    bundle: Optional[Dict[str, Dict[str, str]]],
+) -> str:
+    """Honest soft-ask returned when major_lookup cannot ship a real plan.
+
+    Lists what was retrieved (if anything) so the student can see what we
+    have and what we're asking them to confirm. Always ends with a question
+    so the persona contract holds.
+    """
+    retrieved_tools = sorted(bundle.keys()) if bundle else []
+    bundle_summary = ""
+    if retrieved_tools:
+        bundle_summary = (
+            f" I did pull data from {', '.join(retrieved_tools)}, but it wasn't "
+            "enough to lay out a credible semester-by-semester plan."
+        )
+    return (
+        "I want to give you a solid answer here, but I couldn't pin down everything "
+        "I'd need to map out an accurate course plan from what we have so far."
+        f"{bundle_summary} "
+        "Could you confirm the full program name(s) as they appear in the Penn State "
+        "catalog (for example, 'Computer Science, B.S. (Abington)' or 'Accounting, B.S. "
+        "(Abington)')? If this is a double major, please list both. Once I have that I "
+        "can pull the requirements and map out the right courses for you."
+    )
 
 
 def _build_general_academic_chat_draft(
@@ -3623,7 +4753,13 @@ def _build_general_academic_chat_draft(
             role = "Student" if msg.get('role') == 'user' else "AI Advisor"
             conversation_context += f"{role}: {msg.get('content', '')}\n"
 
-    system_content = """You are a helpful AI Academic Advisor. You help students with course planning, prerequisites, major requirements, graduation planning, and Penn State academic questions. Use the available context to answer accurately."""
+    system_content = (
+        ADVISOR_PERSONA
+        + "\n\nFor this turn you are handling a general academic-advising chat message. "
+        "Help with course planning, prerequisites, major requirements, graduation planning, and Penn State "
+        "academic questions. Use the supplied context to answer accurately and never invent course codes "
+        "or policy text."
+    )
     system_content += f"\n\n{_get_current_datetime_context()}"
     if student_record:
         system_content += f"\n\nStudent Information:\n{student_record}\n"
@@ -3766,6 +4902,22 @@ def _build_executor_draft(
     trace: Optional[Dict[str, Any]],
     retry_reason: Optional[str] = None,
 ) -> Tuple[str, List[str], Dict[str, Any]]:
+    # Structural retry: if the finalizer flagged an ungrounded specificity
+    # (course codes etc. with zero tools used), upgrade this plan to a
+    # grounded path for this attempt before dispatching. This protects every
+    # unexpected question, not just the ones we have keywords for.
+    if retry_reason == "ungrounded_specificity":
+        available = _build_available_tool_inventory(has_transcript_for_plan)
+        canonical_path = _canonical_path_for_domain(plan.domain, plan.deliverable)
+        canonical_tools = _canonical_tools_for_path(canonical_path, available)
+        if not canonical_tools:
+            # Domain doesn't map to a grounded path; fall back to web research.
+            canonical_path = "research_lookup"
+            canonical_tools = _canonical_tools_for_path(canonical_path, available)
+        plan.use_tools = True
+        plan.executor_path = canonical_path
+        plan.allowed_tools = canonical_tools
+
     allowed_tools = set(plan.allowed_tools or [])
 
     if plan.executor_path == "conversation_plan_slice":
@@ -3814,11 +4966,36 @@ def _build_executor_draft(
         return response, tools_used, metadata
 
     if plan.executor_path == "major_lookup":
+        # If the question pins a specific semester of the major
+        # (e.g. "first semester CS", "3rd semester biology"), route to the
+        # deterministic planner: with-transcript -> personalized next-semester
+        # plan, without -> the courses that appear in the standard graduation
+        # plan for that semester of the major/option.
+        target_semester_request = _extract_target_semester_request(
+            plan.corrected_question or user_question
+        )
+        if target_semester_request is not None:
+            response, tools_used, metadata = _build_semester_specific_major_draft(
+                user_question=plan.corrected_question or user_question,
+                target=target_semester_request,
+                conversation_history=conversation_history,
+                has_transcript_for_plan=has_transcript_for_plan,
+                trace=trace,
+                allowed_tools=allowed_tools,
+                user_id=user_id,
+            )
+            if response:
+                return response, tools_used, metadata
+            # Fall through to generic major_lookup if the semester-specific
+            # path could not produce a concrete plan (e.g. missing major).
+
         response, tools_used, metadata = _build_major_lookup_draft(
             plan.corrected_question or user_question,
             trace,
             allowed_tools,
             user_id=user_id,
+            plan=plan,
+            retry_reason=retry_reason,
         )
         return response, tools_used, metadata
 
@@ -3832,7 +5009,19 @@ def _build_executor_draft(
         )
 
     if not plan.use_tools:
-        return "", [], {"source": "general_academic_chat_no_tools"}
+        # Safety net: if the orchestrator somehow left us in a "no tools" state
+        # for a domain that needs grounding, escalate to web_search rather than
+        # returning an empty draft (which invites the finalizer to hallucinate).
+        if _requires_grounded_answer(plan.domain, plan.deliverable):
+            available = _build_available_tool_inventory(has_transcript_for_plan)
+            canonical_tools = _canonical_tools_for_path(
+                _canonical_path_for_domain(plan.domain, plan.deliverable), available
+            ) or _canonical_tools_for_path("research_lookup", available)
+            plan.use_tools = True
+            plan.allowed_tools = canonical_tools
+            allowed_tools = set(canonical_tools)
+        else:
+            return "", [], {"source": "general_academic_chat_no_tools"}
 
     response, tools_used, metadata = _build_general_academic_chat_draft(
         plan.corrected_question or user_question,
@@ -3859,13 +5048,14 @@ def _run_executor_stage(
         recent_messages.append(f"{role}: {content[:250]}")
 
     system_prompt = (
-        "You are the executor stage for an academic advising assistant. "
+        ADVISOR_PERSONA
+        + "\n\nFor this turn you are the executor stage. "
         "Produce the core answer for the user based on the provided execution plan, conversation history, and supporting context. "
         "Use your own reasoning to answer the question. "
         "Treat helper outputs and drafts as supporting evidence, not as the only possible answer. "
         "When no tools are required, answer directly from the conversation history and available context. "
         "Preserve the requested scope exactly. "
-        "If the draft already contains semester blocks, preserve those blocks and do not add extra semesters."
+        "If the draft already contains semester blocks, preserve those blocks verbatim and do not add extra semesters."
     )
     user_prompt = (
         f"{_get_current_datetime_context()}\n"
@@ -4000,6 +5190,11 @@ def generate_conversational_response(
         "is_time_sensitive_fact": _is_time_sensitive_factual_question,
         "extract_source_urls": _extract_source_urls_from_response,
         "indicates_no_answer": _response_indicates_no_answer_found,
+        # Lets the finalizer re-verify any '(prerequisites: ...)' annotations
+        # it ADDS (e.g. in 'Things to consider next' bullets) against the
+        # verified prereq graph from the executor, just like the executor
+        # already does on its own draft.
+        "rewrite_inline_prereqs": _rewrite_inline_prereqs_from_graph,
     }
 
     try:
@@ -4114,7 +5309,12 @@ def generate_plan_from_major_and_year(major, year_level, target_grad_in_years=4)
     # Normalize major and load CSVs
     major_norm = normalize_major_name(major)
     if not major_norm:
-        return f"I couldn't match the major '{major}' to a known program. Please provide the exact major name as listed in the catalog (e.g., 'Business, B.A. (Abington)')."
+        return (
+            f"I want to build out the right plan for you, but I couldn't match '{major}' to a Penn State Abington program. "
+            "Could you share the exact program name as it appears in the catalog "
+            "(for example, 'Business, B.A. (Abington)' or 'Computer Science, B.S. (Abington)')? "
+            "Once I have the official name I can pull the requirements and lay out a 15-credit semester."
+        )
     courses_csv = os.path.join(os.path.dirname(__file__), "processed_psu_courses.csv")
     majors_csv = os.path.join(os.path.dirname(__file__), "all_abington_majors_combined(5).csv")
     if not os.path.exists(courses_csv):

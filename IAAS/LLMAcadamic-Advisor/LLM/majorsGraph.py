@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import re
@@ -17,11 +18,80 @@ from graduationFlowchart import format_planned_course_label, generate_semester_p
 
 
 class MajorGraph:
-    """Generate a semester-plan prerequisite graph for a major."""
+    """Generate a semester-plan prerequisite graph for a major (with on-disk cache)."""
+
+    # Bump this when graph visuals change in a way that should invalidate all caches.
+    _GRAPH_CODE_VERSION = "v2"
 
     def __init__(self, csv_path: str):
         self.df = pd.read_csv(csv_path)
         self.major_names = self.df["Major Name"].tolist()
+        self._csv_path = csv_path
+        self._cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "major_graphs")
+        os.makedirs(self._cache_dir, exist_ok=True)
+
+    # ----- caching helpers -------------------------------------------------
+    def _cache_version_token(self) -> str:
+        """Build a short token that changes when the CSVs or the planner/graph code changes.
+        Any edit to the data or logic invalidates the cache automatically."""
+        parts = [self._GRAPH_CODE_VERSION]
+        here = os.path.dirname(os.path.abspath(__file__))
+        files_for_version = [
+            self._csv_path,
+            os.path.join(here, "processed_psu_courses.csv"),
+            os.path.join(here, "graduationFlowchart.py"),
+            os.path.join(here, "majorsGraph.py"),
+        ]
+        for fp in files_for_version:
+            try:
+                if os.path.exists(fp):
+                    parts.append(f"{os.path.basename(fp)}:{int(os.path.getmtime(fp))}")
+            except Exception:
+                pass
+        digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:10]
+        return digest
+
+    def _cache_path_for(self, major_name: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9]+", "_", major_name).strip("_") or "major"
+        return os.path.join(self._cache_dir, f"{safe}.{self._cache_version_token()}.png")
+
+    def _read_cache(self, path: str) -> io.BytesIO | None:
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                with open(path, "rb") as f:
+                    return io.BytesIO(f.read())
+        except Exception:
+            return None
+        return None
+
+    def _write_cache(self, path: str, buf: io.BytesIO) -> None:
+        try:
+            buf.seek(0)
+            data = buf.read()
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+            buf.seek(0)
+        except Exception:
+            pass
+
+    def _prune_stale_cache(self) -> None:
+        """Drop cached PNGs whose version token no longer matches the current one."""
+        try:
+            current = self._cache_version_token()
+            for name in os.listdir(self._cache_dir):
+                if not name.endswith(".png"):
+                    continue
+                # Expected filename: <major>.<version>.png
+                parts = name.rsplit(".", 2)
+                if len(parts) == 3 and parts[1] != current:
+                    try:
+                        os.remove(os.path.join(self._cache_dir, name))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _find_matching_major(self, query: str) -> str | None:
         if not query:
@@ -128,6 +198,9 @@ class MajorGraph:
             majors_csv = os.path.join(csv_dir, "..", "LLM", "all_abington_majors_combined(5).csv")
 
         # Mirror the no-transcript freshman planning logic used by chat.
+        # Use a softer min/max so the scheduler has breathing room when prereqs
+        # legitimately constrain what fits in a semester (prevents impossible placements
+        # that used to happen when min==max forced prereq bypasses).
         return generate_semester_plan(
             major_name=actual_major_name,
             completed_courses=[],
@@ -137,8 +210,8 @@ class MajorGraph:
             option_name=option_name,
             credits_needed=120,
             max_semesters=8,
-            max_credits_per_sem=15,
-            min_credits_per_sem=15,
+            max_credits_per_sem=16,
+            min_credits_per_sem=12,
         )
 
     def _draw_plan_graph(
@@ -276,15 +349,41 @@ class MajorGraph:
         out.seek(0)
         return out
 
-    def draw_major_graph(self, major_name: str) -> io.BytesIO:
+    def draw_major_graph(self, major_name: str, use_cache: bool = True) -> io.BytesIO:
         actual_major_name = self._find_matching_major(major_name)
         if not actual_major_name:
             raise ValueError(f"Could not find a matching major for '{major_name}'. Please try a different name.")
 
+        cache_path = self._cache_path_for(actual_major_name)
+        if use_cache:
+            self._prune_stale_cache()
+            cached = self._read_cache(cache_path)
+            if cached is not None:
+                return cached
+
         options = self._get_major_options(actual_major_name)
         if options:
-            return self._draw_all_option_graphs(actual_major_name, options)
+            buf = self._draw_all_option_graphs(actual_major_name, options)
+        else:
+            plan = self._build_freshman_plan(actual_major_name, option_name="General Option")
+            buf = self._draw_plan_graph(actual_major_name, plan, option_name="General Option")
 
-        plan = self._build_freshman_plan(actual_major_name, option_name="General Option")
-        return self._draw_plan_graph(actual_major_name, plan, option_name="General Option")
+        if use_cache:
+            self._write_cache(cache_path, buf)
+        return buf
+
+    def clear_cache(self) -> int:
+        """Delete all cached major graph PNGs. Returns count removed."""
+        n = 0
+        try:
+            for name in os.listdir(self._cache_dir):
+                if name.endswith(".png"):
+                    try:
+                        os.remove(os.path.join(self._cache_dir, name))
+                        n += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return n
 

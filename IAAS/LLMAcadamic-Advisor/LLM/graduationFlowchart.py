@@ -75,8 +75,46 @@ def format_planned_course_label(course: str) -> str:
 
 
 def _course_level(c: str) -> int:
-    m = re.search(r"\b(\d{3})\b", c)
+    """Return the 3-digit catalog level for a course code.
+
+    Handles both plain codes (``CMPSC 132``) and codes with letter suffixes used
+    by Penn State to tag writing/honors/etc. (``CMPSC 487W``, ``ENGL 202C``,
+    ``DS 440W``). A strict ``\\b(\\d{3})\\b`` boundary would fail on the
+    suffixed form because ``\\d\\b`` requires a non-word char after the digits,
+    and a letter is still a word char — so ``487W`` never matched and the
+    function used to return 9999 for every W/C/H/M-suffixed course.
+    """
+    m = re.search(r"(?<![A-Z0-9])(\d{3})(?=[A-Z]?\b|\s|$)", c)
     return int(m.group(1)) if m else 9999
+
+
+def _min_sem_by_level(course: str) -> int:
+    """
+    Universal course-level floor: a course numbered in a given range cannot be scheduled
+    earlier than a reasonable typical semester for that level. This catches courses whose
+    prereqs are recorded as non-course text (e.g., IST 495 "Prior approval of proposed
+    assignment by instructor") and would otherwise land in semester 1.
+
+    - Placeholder buckets (GENED__, OPT__, FREE__, ELECTIVE__) are unconstrained.
+    - level < 300 (100s/200s): sem 1+ (freshman/sophomore intro)
+    - 300 <= level < 400: sem 3+ (sophomore/junior)
+    - 400 <= level < 500: sem 5+ (junior/senior)
+    - level >= 500: sem 7+ (senior capstone)
+    """
+    if not isinstance(course, str):
+        return 1
+    if course.startswith(("GENED__", "OPT__", "FREE__", "ELECTIVE__")):
+        return 1
+    lvl = _course_level(course)
+    if lvl == 9999:
+        return 1
+    if lvl < 300:
+        return 1
+    if lvl < 400:
+        return 3
+    if lvl < 500:
+        return 5
+    return 7
 
 
 def _normalize_course_code(code: str) -> str:
@@ -114,14 +152,33 @@ def load_prereq_map(courses_csv_path: str) -> Dict[str, List[str]]:
 
     for _, row in df.iterrows():
         course = str(row.get("course_number", "")).strip()
-        raw = row.get("prerequisite_course_numbers", None)
 
-        prereqs = []
-        if isinstance(raw, str) and raw.strip():
+        # Prefer `prerequisite_data` (direct raw prereq expression) over
+        # `prerequisite_course_numbers` (which is transitively-flattened and pollutes
+        # direct prereqs with prereqs-of-prereqs, causing same-semester violations
+        # like scheduling CMPSC 463 in the same semester as its real prereq CMPSC 462).
+        prereqs: List[str] = []
+        raw_direct = row.get("prerequisite_data", None)
+        if isinstance(raw_direct, str) and raw_direct.strip():
             try:
-                prereqs = [x.strip() for x in eval(raw)]
+                raw_list = eval(raw_direct)
+                if isinstance(raw_list, (list, tuple)):
+                    raw_text = " ".join(str(x) for x in raw_list)
+                else:
+                    raw_text = str(raw_list)
             except Exception:
-                pass
+                raw_text = raw_direct
+            for m in COURSE_TOKEN_RE.finditer(raw_text):
+                prereqs.append(_normalize_course_token(m.group(1), m.group(2)))
+
+        # Fallback: use the flattened column if the direct column gave us nothing.
+        if not prereqs:
+            raw = row.get("prerequisite_course_numbers", None)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    prereqs = [x.strip() for x in eval(raw)]
+                except Exception:
+                    pass
         
         # Expand prerequisites: if a prereq is a base code (e.g., "MATH 311"),
         # check if any actual courses match (e.g., "MATH 311M", "MATH 311W")
@@ -229,6 +286,105 @@ def add_all_prerequisites_to_plan(
     return new_courses
 
 
+def _rebalance_schedule_in_place(
+    scheduled: Dict[str, int],
+    is_available_strict,
+    max_credits_per_sem: int,
+    min_credits_per_sem: int,
+) -> None:
+    """Even out credit load across the used semesters after the greedy pass.
+
+    Moves courses from the most-loaded early semester to the least-loaded later
+    semester, one at a time, as long as:
+      - the destination has real capacity (credits + 3 <= max),
+      - the moved course's prereqs remain satisfied at the destination sem
+        (``is_available_strict`` returns True when the course is hypothetically
+        at that sem),
+      - moving it doesn't push total credits at the source below
+        ``min_credits_per_sem`` when we could avoid that (soft guard).
+
+    The pass is deliberately conservative: it only runs O(len(courses) *
+    num_sems) iterations and stops when no beneficial move is available.
+    Graduation timing (the last used sem) never extends.
+    """
+    if not scheduled:
+        return
+
+    def _sem_credits(target_sem: int) -> int:
+        return sum(3 for _c, _s in scheduled.items() if _s == target_sem)
+
+    last_sem = max(scheduled.values())
+    if last_sem <= 1:
+        return
+
+    # Cap each pass to avoid pathological loops.
+    for _ in range(len(scheduled) * 2):
+        # Identify heaviest and lightest semester within [1, last_sem].
+        loads = {s: _sem_credits(s) for s in range(1, last_sem + 1)}
+        heaviest_sem = max(loads, key=lambda s: (loads[s], -s))
+        lightest_sem = min(
+            (s for s in loads if s > 1),
+            key=lambda s: (loads[s], s),
+            default=None,
+        )
+        if lightest_sem is None:
+            return
+        # Stop if already balanced within one course (3 credits).
+        if loads[heaviest_sem] - loads[lightest_sem] <= 3:
+            return
+        # Only move forward in time: source must be strictly before destination.
+        if heaviest_sem >= lightest_sem:
+            return
+        if loads[lightest_sem] + 3 > max_credits_per_sem:
+            return
+
+        # Pick a candidate from heaviest_sem that can legally move to
+        # lightest_sem. Prefer the course that is most "flexible" (higher
+        # level, fewer downstream blockers). We temporarily detach the
+        # candidate from its current slot when checking availability.
+        candidates = [c for c, s in scheduled.items() if s == heaviest_sem]
+        candidates.sort(key=lambda c: (-_course_level(c), c))
+
+        moved = False
+        for cand in candidates:
+            original_sem = scheduled[cand]
+            # Temporarily remove so is_available_strict doesn't see it as
+            # "same-sem or later" when evaluating its own prereqs.
+            del scheduled[cand]
+            ok = is_available_strict(cand, lightest_sem)
+            scheduled[cand] = original_sem
+            if not ok:
+                continue
+            # Ensure no course scheduled between heaviest_sem+1 and
+            # lightest_sem lists this candidate as a prereq that must be
+            # earlier. We check by temporarily moving and seeing if any
+            # intermediate course becomes un-satisfiable.
+            scheduled[cand] = lightest_sem
+            any_broken = False
+            for other_c, other_s in scheduled.items():
+                if other_c == cand:
+                    continue
+                if other_s <= heaviest_sem:
+                    continue
+                if other_s > lightest_sem:
+                    continue
+                # Temporarily unset to force a fresh availability check.
+                stash = scheduled.pop(other_c)
+                good = is_available_strict(other_c, stash)
+                scheduled[other_c] = stash
+                if not good:
+                    any_broken = True
+                    break
+            if any_broken:
+                scheduled[cand] = original_sem
+                continue
+            moved = True
+            break
+
+        if not moved:
+            return
+
+
 def schedule_mixed_by_prereqs(
     planned_courses: List[str],
     prereq_map: Dict[str, List[str]],
@@ -237,12 +393,21 @@ def schedule_mixed_by_prereqs(
     max_credits_per_sem: int = 18,
     min_credits_per_sem: int = 15,
     completed_courses: Optional[List[str]] = None,
+    apply_level_floor: bool = True,
 ) -> Tuple[Dict[str, int], nx.DiGraph]:
+    """
+    ``apply_level_floor``: when True, 400-level courses can't start before sem 5,
+    300-level before sem 3, etc. This is the right behavior for a freshman-start
+    roadmap. It must be OFF for transcript-based plans where the student is
+    already a junior/senior, because their "Sem 1" is already late in their
+    program and their remaining courses are nearly all 400-level.
+    """
 
     # Normalize all planned courses
     planned_courses_norm = [_normalize_course_code(c) for c in planned_courses]
     planned_set = set(planned_courses_norm)
     remaining = set(planned_courses_norm)
+
     course_category = {
         _normalize_course_code(k): v for k, v in course_category.items()
     }
@@ -346,75 +511,93 @@ def schedule_mixed_by_prereqs(
         raise ValueError("Prerequisite cycle detected")
 
     scheduled: Dict[str, int] = {}
+
+    def _prereq_alternatives(course: str) -> List[str]:
+        """Return the flat list of prereq codes for a course (already OR-alternatives as stored in the CSV)."""
+        return prereq_map.get(course, []) or []
+
+    def _planned_match(prereq_norm: str, prereq_base: Optional[str]) -> Optional[str]:
+        """Return the planned-course code that matches this prereq (exact or base-code), else None."""
+        if prereq_norm in planned_set:
+            return prereq_norm
+        if prereq_base:
+            for planned_course in planned_set:
+                pm = re.match(r"([A-Z]{2,})\s+(\d{3})", planned_course)
+                if pm and f"{pm.group(1)} {pm.group(2)}" == prereq_base:
+                    return planned_course
+        return None
+
+    def _prereq_satisfiable_statically(course: str) -> bool:
+        """True iff at least one prereq alternative is in the plan or completed. No-prereq courses are satisfiable."""
+        alts = _prereq_alternatives(course)
+        if not alts:
+            return True
+        for p in alts:
+            p_norm = _normalize_course_code(p)
+            bm = re.match(r"([A-Z]{2,})\s+(\d{3})", p_norm)
+            p_base = f"{bm.group(1)} {bm.group(2)}" if bm else None
+            if p_norm in completed_set or (p_base and p_base in completed_base_set):
+                return True
+            if _planned_match(p_norm, p_base) is not None:
+                return True
+        return False
+
     def is_available_strict(course: str, current_sem: int) -> bool:
         """
-        STRICT prereq rule:
-        All prereqs that are IN THE PLAN must be completed in a PRIOR semester.
-        Prerequisites that are NOT in the plan are checked:
-        - Check if prerequisite exists in prereq_map (exact match or base code match)
-        - If it exists but is not in plan, block the course (conservative approach)
-        - This prevents impossible placements like MATH 485 in semester 1
+        Prereq rule (hybrid AND/OR) + universal course-level floor:
+        - Course-level floor: a 400-level course cannot start in sem 1 even if the CSV
+          lists no course prereqs (catches IST 495-style capstones).
+        - Every listed prereq that IS in the plan must be scheduled in a strictly earlier
+          semester. This catches same-semester violations (e.g., CMPSC 463 needs CMPSC 462
+          placed in a prior semester; it cannot share sem 4).
+        - At least one alternative (completed coursework, or in-plan-scheduled-earlier) must
+          actually be satisfied. This handles OR expressions where some alternatives are out
+          of the plan.
+        Courses with no course-code prereqs are still gated by the level floor.
         """
-        for p in prereq_map.get(course, []):
-            prereq_norm = _normalize_course_code(p)
-            base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", prereq_norm)
-            prereq_base = (
-                f"{base_match.group(1)} {base_match.group(2)}"
-                if base_match
-                else None
-            )
+        if apply_level_floor and current_sem < _min_sem_by_level(course):
+            return False
 
-            # Prereq already satisfied by completed coursework
+        alts = _prereq_alternatives(course)
+        if not alts:
+            return True
+
+        any_satisfied = False
+        for p in alts:
+            prereq_norm = _normalize_course_code(p)
+            bm = re.match(r"([A-Z]{2,})\s+(\d{3})", prereq_norm)
+            prereq_base = f"{bm.group(1)} {bm.group(2)}" if bm else None
+
             if prereq_norm in completed_set or (
                 prereq_base and prereq_base in completed_base_set
             ):
+                any_satisfied = True
                 continue
 
-            # Check if prerequisite is in plan (exact match or base code match)
-            prereq_in_plan = False
-            prereq_scheduled_sem = None
+            match = _planned_match(prereq_norm, prereq_base)
+            if match is None:
+                # Alternative isn't in the plan at all; not a candidate for satisfaction here.
+                continue
 
-            # First check exact match
-            if prereq_norm in planned_set:
-                prereq_in_plan = True
-                if prereq_norm in scheduled:
-                    prereq_scheduled_sem = scheduled[prereq_norm]
-            
-            # If not exact match, check base code match (e.g., "MATH 311" matches "MATH 311M")
-            if not prereq_in_plan:
-                if prereq_base:
-                    dept, num = prereq_base.split()
-                    # Check if any course in planned_set matches this base code
-                    for planned_course in planned_set:
-                        if re.match(rf'{re.escape(dept)}\s+{re.escape(num)}', planned_course):
-                            prereq_in_plan = True
-                            if planned_course in scheduled:
-                                prereq_scheduled_sem = scheduled[planned_course]
-                            break
-            
-            if prereq_in_plan:
-                # Prerequisite is in the plan - must be scheduled in a PRIOR semester
-                if prereq_scheduled_sem is None:
-                    return False  # Prerequisite not yet scheduled
-                if prereq_scheduled_sem >= current_sem:
-                    return False  # Prerequisite in same or later semester
+            planned_sem = scheduled.get(match)
+            if planned_sem is not None and planned_sem < current_sem:
+                any_satisfied = True
             else:
-                # Prerequisite is NOT in the plan - check if it exists in prereq_map
-                prereq_exists = prereq_norm in prereq_map
-                if not prereq_exists:
-                    # Check if base code exists (e.g., "MATH 311" base code)
-                    if prereq_base:
-                        prereq_exists = prereq_base in prereq_map
-                
-                if prereq_exists:
-                    # This prerequisite exists but is not in our plan
-                    # For semester 1, block to prevent impossible placements (e.g., MATH 485)
-                    # For later semesters, assume prerequisite is satisfied elsewhere
-                    # (transfer credits, placement tests, other majors, etc.)
-                    if current_sem == 1:
-                        return False  # Block from semester 1
-                    # For semesters 2+, allow it (prerequisite assumed satisfied)
-        return True
+                # The prereq IS in the plan but is either unscheduled or scheduled in the
+                # same/later semester. Block so we wait for it to land earlier first.
+                return False
+        return any_satisfied
+
+    # Purge courses that are fundamentally unsatisfiable (have prereqs, but none of the
+    # alternatives exist in the plan or completed coursework). These would otherwise get
+    # jammed into the graph in impossible semesters.
+    unsatisfiable = {c for c in planned_courses_norm if not _prereq_satisfiable_statically(c)}
+    if unsatisfiable:
+        for c in unsatisfiable:
+            remaining.discard(c)
+            planned_set.discard(c)
+            if G.has_node(c):
+                G.remove_node(c)
 
     bucket_order = ["Prescribed", "Additional", "Option", "GenEd"]
 
@@ -434,19 +617,11 @@ def schedule_mixed_by_prereqs(
             ]
 
             if not available:
-                # If no courses available and we haven't met minimum, try to find any available
-                # (even if they have unmet prereqs that aren't in plan - for later semesters)
-                if sem_credits < min_credits_per_sem and sem > 1 and remaining:
-                    # For semesters 2+, allow courses with prereqs not in plan
-                    available = [c for c in remaining]
-                
-                # Also, if we're in later semesters (5+) and have remaining courses,
-                # be more lenient about prerequisites
-                if not available and sem >= 5 and remaining:
-                    available = [c for c in remaining]
-                
-                if not available:
-                    break
+                # Respect prereqs: if nothing is legitimately available this semester,
+                # end the semester (even if below min credits). Previously we bypassed
+                # prereq checks to meet min credits, which caused impossible placements
+                # (e.g., STAT 414 in semester 2 without its prereqs satisfied).
+                break
 
             avail_by_bucket = {b: [] for b in bucket_order}
             for c in available:
@@ -475,19 +650,10 @@ def schedule_mixed_by_prereqs(
                 if sem_credits >= max_credits_per_sem:
                     break
 
-        # If semester ended with less than minimum credits and there are remaining courses,
-        # try to add more courses (relaxing prereq constraints for later semesters)
+        # If below minimum credits, only backfill with honestly-available courses.
+        # Never bypass prereq checks just to hit a credit floor.
         if sem_credits < min_credits_per_sem and remaining:
-            # Try to add more courses to meet minimum (relax constraints for later semesters)
-            additional_available = []
-            if sem > 1:
-                # For later semesters, allow courses even if prereqs not in plan
-                additional_available = [c for c in remaining]
-            else:
-                # For semester 1, only add if truly available
-                additional_available = [c for c in remaining if is_available_strict(c, sem)]
-            
-            # Add courses up to minimum credits while respecting max credits.
+            additional_available = [c for c in remaining if is_available_strict(c, sem)]
             needed_credits = min_credits_per_sem - sem_credits
             courses_to_add = min(len(additional_available), needed_credits // 3)
             for c in additional_available[:courses_to_add]:
@@ -500,58 +666,54 @@ def schedule_mixed_by_prereqs(
         if not remaining:
             break
 
-    # If there are still remaining courses after all semesters, try to schedule them
-    # in later semesters (semesters 5-8) even if prerequisites aren't fully satisfied
-    # This handles cases where prerequisites might be satisfied through other means
-    # (transfer credits, placement tests, etc.) or are from other departments
-    # while respecting the configured semester credit cap.
+    # If there are still remaining courses after all semesters, only place them in the
+    # earliest semester where their prereqs are honestly satisfied AND there is room.
+    # Any course whose prereqs never become satisfiable is dropped (it is excluded from
+    # the roadmap rather than shown in an impossible position).
     if remaining:
+        dropped_orphans: List[str] = []
         for course in list(remaining):
-            # Try to schedule in semesters 5-8 (later semesters are more lenient)
-            for sem in range(5, max_semesters + 1):
-                # Check if semester has room.
+            placed = False
+            for sem in range(1, max_semesters + 1):
+                if not is_available_strict(course, sem):
+                    continue
                 sem_courses = [c for c, s in scheduled.items() if s == sem]
                 sem_credits = len(sem_courses) * 3
-                
                 if sem_credits < max_credits_per_sem:
-                    # Schedule the course in this semester
                     scheduled[course] = sem
                     remaining.remove(course)
+                    placed = True
                     break
-        
-        # If still remaining, schedule them in any available slot.
-        if remaining:
-            for course in list(remaining):
-                for sem in range(1, max_semesters + 1):
-                    sem_courses = [c for c, s in scheduled.items() if s == sem]
-                    sem_credits = len(sem_courses) * 3
-                    
-                    if sem_credits < max_credits_per_sem:
-                        scheduled[course] = sem
-                        remaining.remove(course)
-                        break
+            if not placed:
+                dropped_orphans.append(course)
+                remaining.discard(course)
+                if G.has_node(course):
+                    G.remove_node(course)
 
-    # Only raise error if we truly can't fit all courses (all semesters are at hard limit).
-    if remaining:
-        # Check if all semesters are at configured hard limit.
-        all_full = True
-        for sem in range(1, max_semesters + 1):
-            sem_courses = [c for c, s in scheduled.items() if s == sem]
-            sem_credits = len(sem_courses) * 3
-            if sem_credits < max_credits_per_sem:
-                all_full = False
-                break
-        
-        if all_full:
-            raise ValueError(
-                f"Could not schedule all courses. Remaining: {sorted(remaining)}. "
-                f"All semesters are at maximum capacity ({max_credits_per_sem} credits)."
-            )
-        else:
-            # This shouldn't happen, but if it does, schedule remaining courses in last semester
-            for course in list(remaining):
-                scheduled[course] = max_semesters
-                remaining.remove(course)
+    # #region rebalance pass (H3)
+    # After the greedy scheduler completes, earlier semesters may be packed to
+    # ``max_credits_per_sem`` while the final semester has only the handful of
+    # courses that were waiting on prereq chains. A 9/3/18/12 or 18/18/6 layout
+    # is technically valid but not a plan a student would follow.
+    #
+    # This pass redistributes courses forward (never backward, so prereqs stay
+    # satisfied) while honoring three invariants:
+    #   (1) Every course keeps landing in a semester where its prereqs are met.
+    #   (2) No semester exceeds ``max_credits_per_sem``.
+    #   (3) We do not PUSH past the current ``last_sem``; graduation timing
+    #       stays the same. We only even out credits within the used range.
+    try:
+        _rebalance_schedule_in_place(
+            scheduled=scheduled,
+            is_available_strict=is_available_strict,
+            max_credits_per_sem=max_credits_per_sem,
+            min_credits_per_sem=min_credits_per_sem,
+        )
+    except Exception:
+        # Rebalancing is a best-effort improvement pass; if anything goes wrong
+        # keep the greedy schedule rather than fail the whole request.
+        pass
+    # #endregion
 
     return scheduled, G
 
@@ -1384,6 +1546,10 @@ def generate_semester_plan(
     for c in gened_nodes:
         course_category[c] = "GenEd"
 
+    # If the student already has completed coursework, this is a transcript-based
+    # remaining-plan: their "Sem 1" is already their next semester, not the first
+    # freshman semester, so the freshman-year level floor does not apply.
+    apply_level_floor = not bool(completed_courses)
     scheduled, graph = schedule_mixed_by_prereqs(
         planned_courses=planned_courses,
         prereq_map=prereq_map,
@@ -1391,7 +1557,8 @@ def generate_semester_plan(
         max_semesters=max_semesters,
         max_credits_per_sem=max_credits_per_sem,
         min_credits_per_sem=min_credits_per_sem,
-        completed_courses=completed_courses
+        completed_courses=completed_courses,
+        apply_level_floor=apply_level_floor,
     )
     
     # Build semester structure

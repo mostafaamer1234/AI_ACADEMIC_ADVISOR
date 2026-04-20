@@ -1,114 +1,192 @@
-.markdown-content {
-    line-height: 1.8;
-    color: #333;
-    font-size: 1em;
+/* =============================================================================
+   IAAS Markdown rendering — dark, modern, structured
+   Designed to live inside .iaas-bubble-ai
+   ========================================================================== */
+
+.mdx {
+    color: var(--iaas-text, #f2f3f7);
+    font-size: 0.96rem;
+    line-height: 1.65;
+    word-break: break-word;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
 }
 
-.simple-section {
-    margin-bottom: 1.5em;
+.mdx > *:first-child { margin-top: 0; }
+.mdx > *:last-child  { margin-bottom: 0; }
+
+/* ----- Paragraphs ---------------------------------------------------------- */
+
+.mdx-paragraph {
+    margin: 0;
+    color: var(--iaas-text, #f2f3f7);
 }
 
-.simple-header {
-    font-size: 1.25em;
+/* ----- Headers ------------------------------------------------------------- */
+
+.mdx-header {
+    margin: 4px 0 0 0;
+    font-size: 1.02rem;
     font-weight: 600;
-    color: #333;
-    margin: 1.2em 0 0.8em 0;
-    padding: 0.5em 0;
-    border-bottom: 2px solid #e0e0e0;
+    color: var(--iaas-text, #f2f3f7);
+    letter-spacing: -0.01em;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--iaas-border, rgba(255, 255, 255, 0.08));
 }
-
-.simple-paragraph {
-    margin: 0.6em 0;
-    line-height: 1.8;
-    color: #444;
-}
-
-.simple-list-item {
-    margin: 0.5em 0;
-    padding: 0.4em 0;
-    line-height: 1.7;
-    color: #444;
-    border-left: 3px solid transparent;
-    padding-left: 0.8em;
-}
-
-.simple-list-item:hover {
-    border-left-color: #ddd;
-}
-
-.list-content {
-    color: #444;
-    display: block;
-}
-
-.course-listing {
-    display: block;
-    margin: 0.6em 0;
-    padding: 0.8em;
-    background-color: #f8f9fa;
-    border-left: 3px solid #ddd;
-    border-radius: 4px;
-    line-height: 1.7;
-}
-
-.course-code {
-    font-family: 'Courier New', monospace;
-    font-weight: 600;
-    color: #333;
-    background-color: #f0f0f0;
-    padding: 2px 6px;
-    border-radius: 3px;
-    margin-right: 0.4em;
-    font-size: 0.95em;
+.mdx-header::before {
+    content: '';
     display: inline-block;
+    width: 4px;
+    height: 16px;
+    border-radius: 2px;
+    background: var(--iaas-accent-gradient, linear-gradient(180deg, #7dd3fc, #5eead4));
+    flex-shrink: 0;
 }
 
-.course-code-inline {
-    font-family: 'Courier New', monospace;
-    font-weight: 600;
-    color: #333;
-    background-color: #f0f0f0;
-    padding: 2px 5px;
-    border-radius: 3px;
-    margin: 0 2px;
-    font-size: 0.9em;
-}
+/* ----- Lists --------------------------------------------------------------- */
 
-.course-name {
-    font-weight: 500;
-    color: #333;
-    font-family: inherit;
-    margin-left: 0.3em;
-}
-
-.course-details {
-    font-size: 0.9em;
-    color: #666;
-    font-family: inherit;
-    margin-left: 0.5em;
-    font-style: italic;
-}
-
-/* Ensure proper line breaks */
-.markdown-content {
-    white-space: pre-wrap;
-    word-wrap: break-word;
-}
-
-/* Better spacing between elements */
-.simple-paragraph + .simple-header {
-    margin-top: 1.5em;
-}
-
-.simple-list-item + .simple-list-item {
-    margin-top: 0.4em;
-}
-
-/* Clean up any remaining markdown artifacts */
-.markdown-content :deep(code),
-.markdown-content :deep(pre) {
-    background: transparent;
+.mdx-list {
+    margin: 0;
     padding: 0;
-    font-family: inherit;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
 }
 
+.mdx-list-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    color: var(--iaas-text, #f2f3f7);
+}
+.mdx-list-bullet {
+    flex-shrink: 0;
+    margin-top: 0.55em;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--iaas-accent, #7dd3fc);
+    box-shadow: 0 0 8px rgba(125, 211, 252, 0.55);
+}
+.mdx-list-text {
+    flex: 1;
+    min-width: 0;
+}
+
+/* ----- Course codes (just bold, no color) ---------------------------------- */
+
+.mdx-code {
+    font-weight: 700;
+    color: inherit;
+    white-space: nowrap;
+}
+
+/* ----- Prerequisite annotation (inherits body text) ------------------------ */
+
+.mdx-prereq,
+.mdx-prereq .mdx-prereq-value {
+    color: inherit;
+    font: inherit;
+    font-weight: 400;
+    font-style: normal;
+}
+
+/* ----- Semester block ------------------------------------------------------ */
+
+.mdx-semester {
+    position: relative;
+    border-radius: 14px;
+    padding: 14px 16px 16px;
+    background: linear-gradient(180deg, rgba(125, 211, 252, 0.06), rgba(94, 234, 212, 0.03));
+    border: 1px solid rgba(125, 211, 252, 0.18);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.mdx-semester-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding-bottom: 10px;
+    margin-bottom: 10px;
+    border-bottom: 1px dashed rgba(255, 255, 255, 0.1);
+}
+.mdx-semester-title {
+    font-weight: 700;
+    font-size: 0.98rem;
+    letter-spacing: -0.01em;
+    color: var(--iaas-text, #f2f3f7);
+}
+
+.mdx-semester-credits {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 4px 12px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--iaas-border, rgba(255, 255, 255, 0.08));
+    color: var(--iaas-text, #f2f3f7);
+    flex-shrink: 0;
+}
+.mdx-semester-credits-num {
+    font-weight: 700;
+}
+.mdx-semester-credits-label {
+    font-weight: 400;
+    text-transform: lowercase;
+}
+
+.mdx-semester-courses {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+.mdx-semester-course {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    line-height: 1.55;
+    color: var(--iaas-text, #f2f3f7);
+}
+.mdx-semester-bullet {
+    flex-shrink: 0;
+    margin-top: 0.65em;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: #5eead4;     /* teal-300 */
+    box-shadow: 0 0 8px rgba(94, 234, 212, 0.45);
+}
+.mdx-semester-course-text { flex: 1; min-width: 0; }
+
+.mdx-semester-extras {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px dashed rgba(255, 255, 255, 0.08);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.mdx-semester-note {
+    color: inherit;
+    font: inherit;
+}
+
+/* ----- Mobile -------------------------------------------------------------- */
+
+@media (max-width: 480px) {
+    .mdx { font-size: 0.92rem; }
+    .mdx-semester { padding: 12px 12px 14px; }
+    .mdx-semester-title { font-size: 0.92rem; }
+    .mdx-semester-credits { padding: 3px 10px; font-size: 0.74rem; }
+    .mdx-code-chip { font-size: 0.82em; padding: 1px 6px; }
+}
