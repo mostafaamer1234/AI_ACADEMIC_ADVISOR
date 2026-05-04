@@ -86,45 +86,8 @@ const UnifiedChat = () => {
         if (savedTranscriptFlag === 'true') setTranscriptUploaded(true);
     }, []);
 
-    // #region agent log
-    useEffect(() => {
-        const dbg = (location, message, data, hypothesisId) => {
-            fetch('http://127.0.0.1:7344/ingest/7aa39296-269f-4d56-80dd-ed67ff600ceb', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': '97c192' },
-                body: JSON.stringify({ sessionId: '97c192', location, message, data, hypothesisId, timestamp: Date.now() }),
-            }).catch(() => {});
-        };
-        window.__iaasDbg = dbg;
-        const longtaskCounts = { total: 0, maxMs: 0, sumMs: 0, over100: 0 };
-        try {
-            const po = new PerformanceObserver((list) => {
-                for (const entry of list.getEntries()) {
-                    longtaskCounts.total += 1;
-                    longtaskCounts.sumMs += entry.duration;
-                    if (entry.duration > longtaskCounts.maxMs) longtaskCounts.maxMs = entry.duration;
-                    if (entry.duration > 100) longtaskCounts.over100 += 1;
-                }
-            });
-            po.observe({ entryTypes: ['longtask'] });
-            const flush = setInterval(() => {
-                if (longtaskCounts.total > 0) {
-                    dbg('UnifiedChat.jsx:longtask_window', 'main-thread long tasks observed in last 2s', { ...longtaskCounts }, 'H1');
-                    longtaskCounts.total = 0; longtaskCounts.maxMs = 0; longtaskCounts.sumMs = 0; longtaskCounts.over100 = 0;
-                }
-            }, 2000);
-            return () => { po.disconnect(); clearInterval(flush); };
-        } catch (_) { return; }
-    }, []);
-    // #endregion
-
     useEffect(() => {
         const sessionId = getSessionId();
-        // #region agent log
-        const t0 = performance.now();
-        const hLen = conversationHistory.length;
-        const mLen = messages.length;
-        // #endregion
         if (conversationHistory.length > 0) {
             sessionStorage.setItem(`chat_history_${sessionId}`, JSON.stringify(conversationHistory));
         }
@@ -132,42 +95,18 @@ const UnifiedChat = () => {
             sessionStorage.setItem(`chat_messages_${sessionId}`, JSON.stringify(messages));
         }
         sessionStorage.setItem(`transcript_uploaded_${sessionId}`, transcriptUploaded ? 'true' : 'false');
-        // #region agent log
-        const dt = performance.now() - t0;
-        if (dt > 4 && typeof window.__iaasDbg === 'function') {
-            window.__iaasDbg('UnifiedChat.jsx:sessionStorage_effect', 'sessionStorage sync write duration', { durationMs: +dt.toFixed(2), historyLen: hLen, messagesLen: mLen }, 'H2');
-        }
-        // #endregion
     }, [conversationHistory, messages, transcriptUploaded]);
 
     useEffect(() => {
-        // #region agent log
-        const t0 = performance.now();
-        // #endregion
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-        // #region agent log
-        const dt = performance.now() - t0;
-        if (typeof window.__iaasDbg === 'function') {
-            window.__iaasDbg('UnifiedChat.jsx:scrollIntoView_effect', 'scrollIntoView call duration', { durationMs: +dt.toFixed(2), messagesLen: messages.length, isLoading }, 'H3');
-        }
-        // #endregion
     }, [messages, isLoading]);
 
     // Auto-grow textarea
     useEffect(() => {
-        // #region agent log
-        const t0 = performance.now();
-        // #endregion
         const el = textareaRef.current;
         if (!el) return;
         el.style.height = 'auto';
         el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
-        // #region agent log
-        const dt = performance.now() - t0;
-        if (dt > 2 && typeof window.__iaasDbg === 'function') {
-            window.__iaasDbg('UnifiedChat.jsx:textarea_autogrow', 'textarea autogrow layout read+write duration', { durationMs: +dt.toFixed(2), inputLen: input.length }, 'H4');
-        }
-        // #endregion
     }, [input]);
 
     const handleFileUpload = async (e) => {
@@ -189,7 +128,7 @@ const UnifiedChat = () => {
                 id: Date.now(),
                 role: 'assistant',
                 content:
-                    "Transcript received. I can now tailor graduation plans, course picks, and audits to your record. What would you like me to dig into first?",
+                    "Transcript received. Leo can now tailor graduation plans, course picks, and audits to your record. What would you like to dig into first?",
                 timestamp: new Date(),
                 kind: 'transcript-ack',
             };
@@ -238,7 +177,7 @@ const UnifiedChat = () => {
             setMessages(prev => [...prev, {
                 id: Date.now() + 1,
                 role: 'assistant',
-                content: 'Something went sideways reaching the advisor service. Try again in a moment.',
+                content: 'Something went sideways reaching Leo. Try again in a moment.',
                 timestamp: new Date(),
                 isError: true
             }]);
@@ -300,7 +239,7 @@ const UnifiedChat = () => {
                         <AutoAwesomeRoundedIcon fontSize="small" />
                     </span>
                     <div className="iaas-brand-text">
-                        <span className="iaas-brand-title">Academic Advisor</span>
+                        <span className="iaas-brand-title">Leo</span>
                         <span className="iaas-brand-sub">Penn State Abington · AI powered</span>
                     </div>
                 </div>
@@ -361,7 +300,7 @@ const UnifiedChat = () => {
                         </h1>
                         <p className="iaas-hero-sub">
                             Ask anything about courses, majors, prerequisites, or graduation planning.
-                            Upload your transcript and I'll personalize every recommendation.
+                            Upload your transcript and Leo will personalize every recommendation.
                         </p>
                         <div className="iaas-feature-grid">
                             {FEATURE_CARDS.map((f) => (
@@ -396,7 +335,7 @@ const UnifiedChat = () => {
                                 <div className="iaas-bubble-wrap">
                                     <div className="iaas-bubble-meta">
                                         <span className="iaas-bubble-author">
-                                            {isUser ? 'You' : 'Academic Advisor'}
+                                            {isUser ? 'You' : 'Leo'}
                                         </span>
                                         <span className="iaas-bubble-time">
                                             <ScheduleRoundedIcon fontSize="inherit" />

@@ -3,7 +3,11 @@ import networkx as nx
 import re
 import sys
 import os
+import ast
 import matplotlib.pyplot as plt
+
+
+COURSE_CODE_RE = re.compile(r'\b([A-Z]{2,8}(?:/[A-Z]{2,8})*)\s*(\d{1,3})([A-Z]?)\b', re.IGNORECASE)
 
 # Use built-in layout (no pygraphviz/graphviz system dependency required)
 def _get_graph_layout(G):
@@ -18,13 +22,152 @@ def _get_graph_layout(G):
 def clean_text(text):
     if pd.isna(text):
         return ""
+    if not isinstance(text, str):
+        text = str(text)
     text = text.replace('\xa0', ' ').replace('xa0', ' ').replace('\u00a0', ' ')
-    text = re.sub(r'[^A-Za-z0-9\s:,\.()\[\]]', '', text)
+    text = re.sub(r'[^A-Za-z0-9\s:,\.()\[\]/]', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
+
+def normalize_course_code(code):
+    """Return a canonical PSU course code while preserving suffix letters."""
+    if not isinstance(code, str):
+        code = str(code or "")
+    text = code.replace('\xa0', ' ').replace('\u00a0', ' ').upper().strip()
+    text = re.sub(r'\s+', ' ', text)
+    match = COURSE_CODE_RE.search(text)
+    if not match:
+        return ""
+    subject, number, suffix = match.groups()
+    return f"{subject.upper()} {number}{(suffix or '').upper()}"
+
+
+def _course_base_key(code):
+    normalized = normalize_course_code(code)
+    match = COURSE_CODE_RE.fullmatch(normalized)
+    if not match:
+        return None
+    subject, number, _suffix = match.groups()
+    return subject.upper(), number
+
+
+def _build_catalog_index(catalog_codes):
+    if (
+        isinstance(catalog_codes, tuple)
+        and len(catalog_codes) == 2
+        and isinstance(catalog_codes[0], set)
+        and isinstance(catalog_codes[1], dict)
+    ):
+        return catalog_codes
+    exact = {normalize_course_code(c) for c in (catalog_codes or [])}
+    exact.discard("")
+    by_base = {}
+    for code in exact:
+        base = _course_base_key(code)
+        if base:
+            by_base.setdefault(base, []).append(code)
+    for codes in by_base.values():
+        codes.sort()
+    return exact, by_base
+
+
+def build_course_catalog_index(catalog_codes):
+    return _build_catalog_index(catalog_codes)
+
+
+def _resolve_catalog_code(code, catalog_codes=None):
+    """Map a base-only extracted code to its unique catalog suffix variant.
+
+    The source CSV sometimes has lossy extracted values like ``CMPSC 487`` even
+    though the real catalog course is only ``CMPSC 487W``. If there is no exact
+    base course and exactly one suffixed catalog match, use that real course.
+    When multiple variants exist, keep the base code instead of guessing.
+    """
+    normalized = normalize_course_code(code)
+    if not normalized:
+        return ""
+    exact, by_base = _build_catalog_index(catalog_codes)
+    if not exact or normalized in exact:
+        return normalized
+    match = COURSE_CODE_RE.fullmatch(normalized)
+    if not match:
+        return normalized
+    subject, number, suffix = match.groups()
+    if suffix:
+        return normalized
+    candidates = by_base.get((subject.upper(), number), [])
+    suffixed_candidates = [c for c in candidates if COURSE_CODE_RE.fullmatch(c).group(3)]
+    if normalized not in exact and len(suffixed_candidates) == 1:
+        return suffixed_candidates[0]
+    return normalized
+
+
+def _extract_course_codes(text, catalog_codes=None):
+    cleaned = clean_text(text).upper()
+    codes = []
+    seen = set()
+    for match in COURSE_CODE_RE.finditer(cleaned):
+        subject, number, suffix = match.groups()
+        code = _resolve_catalog_code(f"{subject} {number}{suffix or ''}", catalog_codes)
+        if code and code not in seen:
+            seen.add(code)
+            codes.append(code)
+    return codes
+
+
+def _literal_list_text(value):
+    if value is None or pd.isna(value):
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+    raw = value.strip()
+    if not raw or raw.lower() == "nan":
+        return ""
+    try:
+        parsed = ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+        return raw
+    if isinstance(parsed, (list, tuple, set)):
+        return " ".join(str(item) for item in parsed)
+    return str(parsed)
+
+
+def parse_prerequisite_fields(raw_prereq_data, raw_course_numbers="", catalog_codes=None):
+    """Parse enforced and concurrent prerequisites from CSV fields.
+
+    ``prerequisite_data`` is the higher-fidelity source because it preserves
+    suffixes and explicit concurrent markers. ``prerequisite_course_numbers`` is
+    a lossy extracted fallback only; it must not be used to invent concurrent
+    requirements by diffing against the direct field.
+    """
+    direct_text = _literal_list_text(raw_prereq_data)
+    enforced, concurrent, _concurrent_logic, _prereq_logic = extract_prereq_and_concurrent(
+        direct_text,
+        catalog_codes=catalog_codes,
+    )
+    if enforced or concurrent:
+        return enforced, concurrent
+
+    fallback_text = _literal_list_text(raw_course_numbers)
+    return _extract_course_codes(fallback_text, catalog_codes), []
+
+
+def format_course_prerequisite_summary(row, catalog_codes=None):
+    enforced, concurrent = parse_prerequisite_fields(
+        row.get("prerequisite_data", ""),
+        row.get("prerequisite_course_numbers", ""),
+        catalog_codes=catalog_codes,
+    )
+    parts = []
+    if enforced:
+        parts.append(f"Prerequisites: {', '.join(sorted(enforced))}.")
+    if concurrent:
+        parts.append(f"Concurrent courses: {', '.join(sorted(concurrent))}.")
+    return " ".join(parts)
+
 # Extract prerequisites and concurrent with logical relationships
-def extract_prereq_and_concurrent(text):
+def extract_prereq_and_concurrent(text, catalog_codes=None):
     prereqs, concurrents, concurrent_logic, prereq_logic = [], [], [], []
     if not text:
         return prereqs, concurrents, concurrent_logic, prereq_logic
@@ -40,17 +183,10 @@ def extract_prereq_and_concurrent(text):
     else:
         prereq_text, concurrent_text = text, ""
 
-    # PSU course numbers are 2-3 digits (MATH 21, ENGL 15, ART 11) with an
-    # optional single-letter suffix (ENGL 202D, ART 122Y). The previous regex
-    # required exactly 3 digits, which silently dropped every 2-digit prereq
-    # at graph-build time — that's why MATH 140 came back as "no prereqs":
-    # its real prereq "MATH 22 AND MATH 26" never made it into the graph.
-    course_code_pat = r'[A-Z]{2,}\s+\d{2,3}[A-Z]?'
-
     # Handle prereq logic (supporting OR)
     prereq_or_groups = re.split(r'\s+OR\s+', prereq_text)
     for group in prereq_or_groups:
-        matches = re.findall(course_code_pat, group)
+        matches = _extract_course_codes(group, catalog_codes)
         if matches:
             if 'AND' in group:
                 prereqs.extend(matches)
@@ -66,28 +202,26 @@ def extract_prereq_and_concurrent(text):
     grouped = re.split(r'\s+OR\s+', concurrent_text)
     for g in grouped:
         if 'AND' in g:
-            and_group = re.findall(course_code_pat, g)
+            and_group = _extract_course_codes(g, catalog_codes)
             if and_group:
                 concurrents.extend(and_group)
                 concurrent_logic.append(' and '.join(and_group))
         else:
-            or_course = re.findall(course_code_pat, g)
+            or_course = _extract_course_codes(g, catalog_codes)
             if or_course:
                 concurrents.extend(or_course)
                 concurrent_logic.append(or_course[0])
 
-    prereqs = list(set([p for p in prereqs if p not in concurrents]))
-    return prereqs, list(set(concurrents)), concurrent_logic, prereq_logic
+    concurrent_set = set(concurrents)
+    prereqs = [p for p in dict.fromkeys(prereqs) if p not in concurrent_set]
+    return prereqs, list(dict.fromkeys(concurrents)), concurrent_logic, prereq_logic
 
 def parse_course_codes_from_requirements(requirements_str):
     """Parse course codes from a requirements string."""
     if not requirements_str or pd.isna(requirements_str):
         return []
 
-    # 2-3 digit course numbers (PSU has both shapes — see note in
-    # extract_prereq_and_concurrent above).
-    courses = re.findall(r'[A-Z]{2,}\s+\d{2,3}[A-Z]?', requirements_str)
-    return [course.strip() for course in courses]
+    return _extract_course_codes(requirements_str)
 
 
 def get_major_course_codes(major_name):
@@ -125,14 +259,19 @@ def build_course_graph(csv_file):
     df = pd.read_csv(csv_file)
     df.fillna("", inplace=True)
     G = nx.DiGraph()
+    catalog_codes = [row["course_number"] for _, row in df.iterrows()]
+    catalog_index = _build_catalog_index(catalog_codes)
 
     for _, row in df.iterrows():
-        course = clean_text(row["course_number"]).upper()
+        course = normalize_course_code(row["course_number"])
         prereq_data = clean_text(row["prerequisite_data"])
 
         G.add_node(course)
 
-        prereqs, concurrents, _, _ = extract_prereq_and_concurrent(prereq_data)
+        prereqs, concurrents, _, _ = extract_prereq_and_concurrent(
+            prereq_data,
+            catalog_codes=catalog_index,
+        )
 
         for prereq in prereqs:
             G.add_edge(prereq, course, type="prereq")
@@ -145,6 +284,7 @@ def build_course_graph(csv_file):
 # Get course prerequisites with formatted logic
 
 def get_course_prerequisites(course_code, G):
+    course_code = normalize_course_code(course_code)
     if course_code not in G:
         return f"No course named '{course_code}' found."
 
@@ -152,26 +292,19 @@ def get_course_prerequisites(course_code, G):
     concurrents = [u for u, v, d in G.in_edges(course_code, data=True) if d.get("type") == "concurrent"]
 
     df = pd.read_csv(csv_file_path)
+    catalog_codes = [str(c) for c in df["course_number"].dropna().tolist()]
+    catalog_index = _build_catalog_index(catalog_codes)
     row = df[df["course_number"].str.upper().str.strip() == course_code.upper()]
 
     enforced_prereqs = []
     concurrent_options = []
 
     if not row.empty:
-        raw_prereq_data = str(row.iloc[0].get("prerequisite_data", "") or "")
-        raw_course_numbers = str(row.iloc[0].get("prerequisite_course_numbers", "") or "")
-        try:
-            # prerequisite_data typically holds enforced prereqs
-            enforced_prereqs = list({c.strip() for c in eval(raw_prereq_data)}) if raw_prereq_data else []
-        except Exception:
-            enforced_prereqs = prereqs
-        try:
-            all_listed = list({c.strip() for c in eval(raw_course_numbers)}) if raw_course_numbers else []
-        except Exception:
-            all_listed = []
-
-        # Anything listed but not in enforced_prereqs becomes concurrent/“at enrollment” options
-        concurrent_options = [c for c in all_listed if c not in enforced_prereqs]
+        enforced_prereqs, concurrent_options = parse_prerequisite_fields(
+            row.iloc[0].get("prerequisite_data", ""),
+            row.iloc[0].get("prerequisite_course_numbers", ""),
+            catalog_codes=catalog_index,
+        )
 
         # Fallback to graph edges if lists are empty
         if not enforced_prereqs and prereqs:

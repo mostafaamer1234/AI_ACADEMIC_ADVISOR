@@ -12,6 +12,58 @@ export const getLlmBaseUrl = () => {
     return "/llm";
 };
 
+export const getAuthBaseUrl = () => {
+    const envUrl = process.env.REACT_APP_AUTH_URL;
+    if (envUrl) {
+        return envUrl.replace(/\/+$/, "");
+    }
+    if (typeof window !== "undefined") {
+        const host = window.location.hostname;
+        if (host === "localhost" || host === "127.0.0.1") {
+            return "http://localhost:5001/api";
+        }
+    }
+    return "/api";
+};
+
+const requestJson = async (url, options = {}) => {
+    const response = await fetch(url, {
+        ...options,
+        headers: {
+            "Content-Type": "application/json",
+            ...(options.headers || {}),
+        },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(data.error || `HTTP error! status: ${response.status}`);
+    }
+    return data;
+};
+
+const authHeader = () => {
+    if (typeof window === "undefined") {
+        return {};
+    }
+    const token = window.localStorage.getItem("token");
+    return token ? { Authorization: `Bearer ${token}` } : {};
+};
+
+export const loginUser = async ({ email, password }) => {
+    return requestJson(`${getAuthBaseUrl()}/login`, {
+        method: "POST",
+        body: JSON.stringify({ email, password }),
+    });
+};
+
+export const registerUser = async ({ name, email, password, role, sex, dateOfBirth }) => {
+    return requestJson(`${getAuthBaseUrl()}/register`, {
+        method: "POST",
+        headers: authHeader(),
+        body: JSON.stringify({ name, email, password, role, sex, dateOfBirth }),
+    });
+};
+
 export const generateResponse = async (userQuestion, conversationHistory = [], userId = 'default') => {
     try {
         const runtimeDebug =

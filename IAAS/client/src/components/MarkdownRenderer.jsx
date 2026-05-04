@@ -6,6 +6,9 @@ const COURSE_CODE_RE = /\b([A-Z]{2,})\s+(\d{1,3}[A-Z]?)\b/g;
 const SEMESTER_HEADER_RE = /^\s*Semester\s+\d+\b[^\n]*$/i;
 const TOTAL_CREDITS_RE = /^\s*Total\s+Credits?\s*:\s*([\d.]+)\s*$/i;
 const PREREQ_PAREN_RE = /\(prerequisites?:\s*([^)]+)\)/i;
+const COMPACT_SEMESTER_LINE_RE = /^\s*["']?\s*(Semester\s+\d+)\s*:\s*(.*?)\s*Total\s+Credits?\s*:\s*([\d.]+)\s*["']?\s*$/i;
+const COMPACT_SEMESTER_ITEM_START_RE =
+    /(?=\b(?:[A-Z]{2,8}(?:\/[A-Z]{2,8})?\s+\d{1,3}[A-Z]?\s*(?::|\(prerequisites?:)|(?:GQ|GN|GH|GS|GA|GWS|GHW|US|IL)\s+course\b|Open\s+slot\b|Free\s+Elective\b|Option\s+Elective\b))/gi;
 
 // Strip annotations the user has explicitly asked us never to render: when the
 // system couldn't retrieve a prerequisite, just drop the parenthetical entirely
@@ -15,6 +18,37 @@ const STRIP_UNKNOWN_PREREQ_RE =
     /\s*\((?:enforced\s+)?prerequisites?:\s*(?:not\s+retrieved|not\s+listed[^)]*|unknown|unavailable|n\/?a)\s*\)/gi;
 const stripUnknownPrereqAnnotations = (text) =>
     typeof text === 'string' ? text.replace(STRIP_UNKNOWN_PREREQ_RE, '') : text;
+
+const splitCompactSemesterItems = (body) => {
+    if (!body) return [];
+    const starts = [];
+    let m;
+    const startRegex = new RegExp(COMPACT_SEMESTER_ITEM_START_RE.source, 'gi');
+    while ((m = startRegex.exec(body)) !== null) {
+        starts.push(m.index);
+        if (startRegex.lastIndex === m.index) startRegex.lastIndex += 1;
+    }
+    if (!starts.length) return [body.trim()].filter(Boolean);
+    if (starts[0] !== 0 && body.slice(0, starts[0]).replace(/[ ;,-]/g, '').trim()) {
+        starts.unshift(0);
+    }
+    return starts
+        .map((start, idx) => body.slice(start, starts[idx + 1] || body.length).trim().replace(/[ ;]+$/g, ''))
+        .filter(Boolean);
+};
+
+const canonicalizeSemesterBlocks = (text) => {
+    if (typeof text !== 'string' || !text) return text;
+    return text.split('\n').map((rawLine) => {
+        const match = COMPACT_SEMESTER_LINE_RE.exec(rawLine.trim());
+        if (!match) return rawLine;
+        const [, semester, body, credits] = match;
+        const lines = [`${semester}:`];
+        splitCompactSemesterItems(body).forEach((item) => lines.push(`- ${item}`));
+        lines.push(`Total Credits: ${credits}`);
+        return lines.join('\n');
+    }).join('\n');
+};
 
 /* -------------------------------------------------------------------------- */
 /*  Inline formatting                                                         */
@@ -240,7 +274,9 @@ const MarkdownRenderer = ({ content }) => {
     // Then drop any "(prerequisites: not retrieved)" / "(prerequisites: not
     // listed in our course data)" annotations so they never reach the user.
     const cleaned = stripUnknownPrereqAnnotations(
-        content.replace(/^#{1,6}\s+/gm, '**$&').replace(/\*\*#{1,6}\s+/g, '**')
+        canonicalizeSemesterBlocks(content)
+            .replace(/^#{1,6}\s+/gm, '**$&')
+            .replace(/\*\*#{1,6}\s+/g, '**')
     );
     const blocks = splitBlocks(cleaned);
 

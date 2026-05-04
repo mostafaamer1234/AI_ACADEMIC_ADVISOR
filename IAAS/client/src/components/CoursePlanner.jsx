@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
-import axios from 'axios';
 import '../styles/Dashboard.css'; // Ensure consistent styling
-import { setupEnvironment } from '../services/apiService';
+import { generateResponse, setupEnvironment } from '../services/apiService';
 
 const CoursePlanner = ({ setDisableButton }) => {
     const [graduationPlan, setGraduationPlan] = useState(''); // Centralized state
@@ -42,12 +41,13 @@ const CoursePlanner = ({ setDisableButton }) => {
     const generateGraduationPlan = async () => {
         setLoading(true);
         try {
-            const response = await axios.post('/llm/generate-response', {
-                user_question: 'Generate a Graduation Plan based on my major from what-if report',
-                user_id: getUserId(),
-            });
+            const result = await generateResponse(
+                'Generate a Graduation Plan based on my major from what-if report',
+                [],
+                getUserId()
+            );
 
-            setGraduationPlan(response.data.graduation_plan || 'No plan generated.');
+            setGraduationPlan(result.response || 'No plan generated.');
             setDisableButton(false);
         } catch (error) {
             console.error('Error generating graduation plan:', error);

@@ -4,6 +4,9 @@ import os
 import io
 import logging
 import hashlib
+import json
+import sqlite3
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -26,14 +29,142 @@ from LLM.majorsGraph import MajorGraph
 
 # Import Flask modules
 from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS, cross_origin
+from flask_cors import CORS
 app = Flask(__name__)
-CORS(app, origins=['http://localhost:3000', 'http://127.0.0.1:3000', 'http://13.58.145.194', '*'])
 
-# In-memory storage for conversation history (keyed by user_id/session_id)
-# In production, use a database or Redis
-conversation_storage = {}
-user_transcript_hash = {}
+def _configured_cors_origins():
+    configured = os.getenv("LLM_CORS_ORIGINS", "")
+    if configured.strip():
+        return [origin.strip() for origin in configured.split(",") if origin.strip()]
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://13.58.145.194",
+        "https://13.58.145.194",
+    ]
+
+CORS(app, origins=_configured_cors_origins())
+
+class SessionStateStore:
+    """Conversation/transcript metadata store.
+
+    Defaults to in-memory state for local development. Set IAAS_SESSION_DB_PATH
+    to use SQLite-backed state that survives process restarts and can be moved
+    behind a managed database adapter later without changing route logic.
+    """
+
+    def __init__(self, sqlite_path: str = ""):
+        self._sqlite_path = (sqlite_path or "").strip()
+        self._lock = threading.RLock()
+        self._memory_conversations = {}
+        self._memory_transcript_hashes = {}
+        self._conn = None
+        if self._sqlite_path:
+            db_dir = os.path.dirname(os.path.abspath(self._sqlite_path))
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+            self._conn = sqlite3.connect(self._sqlite_path, check_same_thread=False)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_state (
+                    user_id TEXT PRIMARY KEY,
+                    conversation_json TEXT NOT NULL DEFAULT '[]',
+                    transcript_hash TEXT
+                )
+                """
+            )
+            self._conn.commit()
+
+    def _ensure_row(self, user_id: str):
+        self._conn.execute(
+            "INSERT OR IGNORE INTO session_state (user_id, conversation_json) VALUES (?, '[]')",
+            (user_id,),
+        )
+
+    @staticmethod
+    def _safe_history(raw_json: str):
+        try:
+            parsed = json.loads(raw_json or "[]")
+            return parsed if isinstance(parsed, list) else []
+        except (TypeError, json.JSONDecodeError):
+            return []
+
+    def get_conversation(self, user_id: str):
+        if not self._conn:
+            return list(self._memory_conversations.get(user_id, []))
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT conversation_json FROM session_state WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return self._safe_history(row[0]) if row else []
+
+    def set_conversation(self, user_id: str, history):
+        safe_history = list(history or [])[-50:]
+        if not self._conn:
+            self._memory_conversations[user_id] = safe_history
+            return safe_history
+        payload = json.dumps(safe_history)
+        with self._lock:
+            self._ensure_row(user_id)
+            self._conn.execute(
+                "UPDATE session_state SET conversation_json = ? WHERE user_id = ?",
+                (payload, user_id),
+            )
+            self._conn.commit()
+        return safe_history
+
+    def append_messages(self, user_id: str, messages):
+        history = self.get_conversation(user_id)
+        history.extend(messages)
+        return self.set_conversation(user_id, history)
+
+    def clear_conversation(self, user_id: str):
+        return self.set_conversation(user_id, [])
+
+    def get_transcript_hash(self, user_id: str) -> str:
+        if not self._conn:
+            return self._memory_transcript_hashes.get(user_id, "no_transcript")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT transcript_hash FROM session_state WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            return row[0] if row and row[0] else "no_transcript"
+
+    def set_transcript_hash(self, user_id: str, doc_hash: str):
+        if not self._conn:
+            self._memory_transcript_hashes[user_id] = doc_hash
+            return
+        with self._lock:
+            self._ensure_row(user_id)
+            self._conn.execute(
+                "UPDATE session_state SET transcript_hash = ? WHERE user_id = ?",
+                (doc_hash, user_id),
+            )
+            self._conn.commit()
+
+    def delete_transcript_hash(self, user_id: str):
+        if not self._conn:
+            self._memory_transcript_hashes.pop(user_id, None)
+            return
+        with self._lock:
+            self._ensure_row(user_id)
+            self._conn.execute(
+                "UPDATE session_state SET transcript_hash = NULL WHERE user_id = ?",
+                (user_id,),
+            )
+            self._conn.commit()
+
+    def close(self):
+        if self._conn:
+            with self._lock:
+                self._conn.close()
+                self._conn = None
+
+
+SESSION_STORE = SessionStateStore(os.getenv("IAAS_SESSION_DB_PATH", ""))
 
 
 def get_cache_key(user_id: str, doc_hash: str, user_question: str,
@@ -56,8 +187,8 @@ def get_cache_key(user_id: str, doc_hash: str, user_question: str,
     return hashlib.sha256(key_str.encode()).hexdigest()
 
 def get_user_transcript_hash(user_id: str) -> str:
-    """Get transcript hash for user (in-memory)."""
-    return user_transcript_hash.get(user_id, "no_transcript")
+    """Get transcript hash for user/session."""
+    return SESSION_STORE.get_transcript_hash(user_id)
 
 def compute_file_hash(file_path: str) -> str:
     """Compute SHA256 hash of a file."""
@@ -103,10 +234,11 @@ def generate_graduation_plan():
         doc_hash = get_user_transcript_hash(user_id)
         model_version = os.getenv("ADVISOR_MODEL_NAME", "gpt-5.4-mini")
         prompt_version = "v1"  # Or get from config
+        stored_history = SESSION_STORE.get_conversation(user_id)
         
         # Response cache is intentionally disabled so every query executes full
         # reasoning/planning/tool-use/validation with fresh context.
-        history_tail_for_cache = conversation_history[-6:] if conversation_history else conversation_storage.get(user_id, [])[-6:]
+        history_tail_for_cache = conversation_history[-6:] if conversation_history else stored_history[-6:]
         cache_key = get_cache_key(
             user_id,
             doc_hash,
@@ -120,34 +252,26 @@ def generate_graduation_plan():
             cached = RESPONSE_CACHE[cache_key]
             from datetime import datetime, timedelta
             if datetime.now() - cached['timestamp'] < timedelta(hours=CACHE_TTL_HOURS):
-                # Get existing conversation history
-                if user_id not in conversation_storage:
-                    conversation_storage[user_id] = []
                 if conversation_history and len(conversation_history) > 0:
-                    conversation_storage[user_id] = conversation_history
+                    stored_history = SESSION_STORE.set_conversation(user_id, conversation_history)
                 
                 return jsonify({
                     "graduation_plan": cached['response'],
-                    "conversation_history": conversation_storage[user_id],
+                    "conversation_history": stored_history,
                     "cached": True,
                     "debug_trace": get_execution_trace_for_user(user_id)
                 }), 200
 
-        # Get existing conversation history for this user
-        # Use the history from frontend if provided, otherwise use stored history
-        if user_id not in conversation_storage:
-            conversation_storage[user_id] = []
-        
         # Update with frontend history if provided (sync frontend and backend state)
         if conversation_history and len(conversation_history) > 0:
-            conversation_storage[user_id] = conversation_history
+            stored_history = SESSION_STORE.set_conversation(user_id, conversation_history)
         
         # Generate response with existing conversation history (before adding current message)
         # Pass user's transcript status so we don't use another user's transcript
         user_has_transcript = (doc_hash != "no_transcript")
         result = generate_conversational_response(
             user_question,
-            conversation_storage[user_id],
+            stored_history,
             user_id=user_id,
             user_has_transcript=user_has_transcript,
             debug_mode=debug_trace
@@ -162,22 +286,20 @@ def generate_graduation_plan():
             }
         
         # Add user message and AI response to history after generation
-        conversation_storage[user_id].append({
-            'role': 'user',
-            'content': user_question
-        })
-        conversation_storage[user_id].append({
-            'role': 'assistant',
-            'content': result
-        })
-        
-        # Keep only last 50 messages to prevent memory issues
-        if len(conversation_storage[user_id]) > 50:
-            conversation_storage[user_id] = conversation_storage[user_id][-50:]
+        stored_history = SESSION_STORE.append_messages(user_id, [
+            {
+                'role': 'user',
+                'content': user_question
+            },
+            {
+                'role': 'assistant',
+                'content': result
+            },
+        ])
 
         return jsonify({
             "graduation_plan": result,
-            "conversation_history": conversation_storage[user_id],
+            "conversation_history": stored_history,
             "cached": False,
             "debug_trace": get_execution_trace_for_user(user_id)
         }), 200
@@ -205,11 +327,10 @@ def clear_conversation():
         data = request.get_json() or {}
         user_id = data.get('user_id', 'default')
 
-        if user_id in conversation_storage:
-            conversation_storage[user_id] = []
+        SESSION_STORE.clear_conversation(user_id)
         clear_search_context_for_user(user_id)
 
-        user_transcript_hash.pop(user_id, None)
+        SESSION_STORE.delete_transcript_hash(user_id)
         reset_uploaded_transcript_state()
 
         stale_cache_keys = [
@@ -261,7 +382,7 @@ def handle_setup_environment():
 
         # Track transcript hash per user for cache scoping
         doc_hash = compute_file_hash(temp_path)
-        user_transcript_hash[user_id] = doc_hash
+        SESSION_STORE.set_transcript_hash(user_id, doc_hash)
         
         # Verify the file was saved and is readable
         if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:

@@ -352,6 +352,25 @@ class StructuralRoutingRegressionTests(unittest.TestCase):
         "web_search",
     ]
 
+    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    def test_legacy_route_query_honors_llm_before_keyword_fallback(self):
+        """The fallback router must not let keyword/course-code rules override
+        an LLM classification. This guards the same failure class as the
+        double-major issue: structured model routing owns the route, and
+        deterministic rules are only a fallback.
+        """
+        with patch.object(main_copy, "_classify_intent_llm", return_value="policy"):
+            route = main_copy.route_query("What is the CMPSC 488 late drop policy?")
+
+        self.assertEqual(route, "policy")
+
+    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    def test_legacy_route_query_uses_keywords_only_when_llm_classification_fails(self):
+        with patch.object(main_copy, "_classify_intent_llm", return_value=None):
+            route = main_copy.route_query("What are the prerequisites for CMPSC 488?")
+
+        self.assertEqual(route, "course")
+
     def _plan(self, question, llm_json="", history=None, has_transcript=False, available=None):
         return build_orchestration_plan(
             user_question=question,
@@ -523,6 +542,47 @@ class StructuralRoutingRegressionTests(unittest.TestCase):
             executor_result=result,
         )
         self.assertNotIn("ungrounded_specificity", validation["issues"])
+
+    def test_course_code_regex_accepts_short_psu_codes(self):
+        from orchestration_pipeline import COURSE_CODE_RE
+
+        text = "PSU 1, ART 11, SOC 1, ENGL 15, and CMPSC 131 are valid course codes."
+        self.assertEqual(
+            [m.group(0).upper() for m in COURSE_CODE_RE.finditer(text)],
+            ["PSU 1", "ART 11", "SOC 1", "ENGL 15", "CMPSC 131"],
+        )
+
+    def test_compact_semester_line_is_canonicalized_before_validation(self):
+        from orchestration_pipeline import OrchestrationPlan, validate_final_response
+
+        plan = OrchestrationPlan(
+            original_question="give me a CS plan",
+            normalized_question="give me a cs plan",
+            corrected_question="Give me a Computer Science plan.",
+            resolved_user_need="Plan one semester.",
+            domain="major",
+            deliverable="single_semester_plan",
+            plan_scope="single_semester",
+            semester_horizon=1,
+            use_tools=True,
+            allowed_tools=["majors_retriever", "course_retriever"],
+            executor_path="major_lookup",
+        )
+        response = (
+            '"Semester 1: PSU 1: First-Year Seminar Abington (prerequisites: None) '
+            'CMPSC 131: Programming and Computation I (prerequisites: None) '
+            'MATH 140: Calculus I (prerequisites: None) Total Credits: 7"'
+        )
+        result = ExecutorResult(
+            response=response,
+            tools_used=["majors_retriever", "course_retriever"],
+            metadata={},
+        )
+
+        report = validate_final_response(plan, response, result)
+        self.assertEqual(report["semester_block_count"], 1)
+        self.assertNotIn("missing_inline_prereqs", report["issues"])
+        self.assertNotIn("scope_mismatch_single_semester", report["issues"])
 
     def test_ungrounded_specificity_retry_upgrades_plan(self):
         """End-to-end: when the first attempt produces hallucinated codes with
@@ -922,6 +982,80 @@ class PersonalityRegressionTests(unittest.TestCase):
             any(token in lowered for token in ("happy", "glad", "love to", "want to")),
             "soft-ask must open in a warm/encouraging voice",
         )
+
+
+class PromptEngineeringRegressionTests(unittest.TestCase):
+    """Locks in the prompt-engineering contract for model-facing prompts."""
+
+    def test_private_reasoning_guidance_is_safe_and_reusable(self):
+        from orchestration_pipeline import PRIVATE_REASONING_GUIDANCE
+
+        lowered = PRIVATE_REASONING_GUIDANCE.lower()
+        self.assertIn("reason privately", lowered)
+        self.assertIn("do not reveal private chain-of-thought", lowered)
+        self.assertIn("evidence summary", lowered)
+
+    def test_advisor_persona_names_leo_and_blocks_foul_language(self):
+        from orchestration_pipeline import ADVISOR_PERSONA, AGENT_DISPLAY_NAME, LANGUAGE_SAFETY_POLICY
+
+        self.assertEqual(AGENT_DISPLAY_NAME, "Leo")
+        self.assertIn("Leo", ADVISOR_PERSONA)
+        lowered_policy = LANGUAGE_SAFETY_POLICY.lower()
+        self.assertIn("never write, quote, list, transform, repeat", lowered_policy)
+        self.assertIn("foul language", lowered_policy)
+        self.assertIn("endorse", lowered_policy)
+
+    def test_public_response_sanitizer_removes_foul_language(self):
+        from orchestration_pipeline import sanitize_public_response
+
+        blocked_word = "s" + "h" + "i" + "t"
+        clean = sanitize_public_response(f"That is {blocked_word}.")
+
+        self.assertNotIn(blocked_word, clean.lower())
+        self.assertIn("[removed]", clean)
+
+    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    def test_foul_language_requests_are_refused_before_model_call(self):
+        self.assertTrue(main_copy._is_foul_language_request("please list curse words"))
+        refusal = main_copy._foul_language_refusal()
+        self.assertIn("can't help", refusal)
+        self.assertIn("Leo", refusal)
+        self.assertIn("endorse foul language", refusal)
+
+        response = main_copy.generate_conversational_response(
+            "please list curse words",
+            [],
+            user_id="clean-language-test",
+        )
+        self.assertEqual(response, refusal)
+
+    def test_model_system_prompts_include_output_contracts_and_examples(self):
+        import inspect
+        import orchestration_pipeline
+
+        prompt_sources = [
+            inspect.getsource(orchestration_pipeline.build_orchestration_plan),
+            inspect.getsource(orchestration_pipeline.run_finalizer_stage),
+        ]
+        if main_copy is not None:
+            prompt_sources.extend([
+                inspect.getsource(main_copy._classify_intent_llm),
+                inspect.getsource(main_copy._build_reasoning_plan),
+                inspect.getsource(main_copy._build_policy_lookup_draft),
+                inspect.getsource(main_copy._build_major_lookup_draft),
+                inspect.getsource(main_copy._build_general_academic_chat_draft),
+                inspect.getsource(main_copy._run_executor_stage),
+            ])
+
+        for source in prompt_sources:
+            self.assertIn("PRIVATE_REASONING_GUIDANCE", source)
+            self.assertIn("example", source.lower())
+            self.assertTrue(
+                "Output contract" in source
+                or "Required response shape" in source
+                or "Required semester block shape" in source,
+                "prompt should define a concrete output contract",
+            )
 
 
 class RetrievalPlanContractTests(unittest.TestCase):
@@ -2213,6 +2347,55 @@ class MultiMajorContractTests(unittest.TestCase):
         self.assertEqual([s["tool"] for s in steps],
                          ["majors_retriever", "course_retriever", "prerequisite_graph"])
 
+    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    def test_executor_keeps_multi_major_plan_on_llm_retrieval_path(self):
+        """The LLM orchestrator's multi-major route must not be overwritten by
+        the single-major deterministic planner shortcut.
+
+        This is the Biology + Computer Science failure mode: the route correctly
+        knows there are two majors, but a later executor shortcut extracted one
+        major and generated a single-major standard plan.
+        """
+        from orchestration_pipeline import OrchestrationPlan
+
+        plan = OrchestrationPlan(
+            original_question="biology and computer science double major plan",
+            normalized_question="biology and computer science double major plan",
+            corrected_question="biology and computer science double major plan",
+            resolved_user_need="full plan covering both majors",
+            domain="major",
+            deliverable="full_graduation_plan",
+            plan_scope="full_graduation",
+            semester_horizon=8,
+            use_tools=True,
+            allowed_tools=["majors_retriever", "course_retriever", "prerequisite_graph"],
+            executor_path="major_lookup",
+            retrieval_plan=[{"tool": "majors_retriever", "query": "Biology", "reason": "r"}],
+            majors=["Biology", "Computer Science"],
+        )
+
+        with patch.object(main_copy, "generate_plan_from_major_and_year") as deterministic_planner, \
+             patch.object(
+                 main_copy,
+                 "_build_major_lookup_draft",
+                 return_value=("multi-major grounded draft", ["majors_retriever"], {"source": "major_lookup_rag"}),
+             ) as major_lookup:
+            response, tools_used, metadata = main_copy._build_executor_draft(
+                user_id="test",
+                plan=plan,
+                user_question=plan.corrected_question,
+                conversation_history=[],
+                has_transcript_for_plan=False,
+                student_data=None,
+                trace=None,
+            )
+
+        deterministic_planner.assert_not_called()
+        major_lookup.assert_called_once()
+        self.assertEqual(response, "multi-major grounded draft")
+        self.assertEqual(tools_used, ["majors_retriever"])
+        self.assertEqual(metadata["source"], "major_lookup_rag")
+
     def test_validator_flags_single_major_response_to_double_major_request(self):
         from orchestration_pipeline import _validate_multi_major_coverage
         art_only = (
@@ -2223,6 +2406,24 @@ class MultiMajorContractTests(unittest.TestCase):
         detail = _validate_multi_major_coverage(art_only, ["Art", "Accounting"])
         self.assertIsNotNone(detail)
         self.assertIn("Accounting", detail)
+
+    def test_validator_rejects_multi_major_plan_with_unlabeled_course_lines(self):
+        from orchestration_pipeline import _validate_multi_major_coverage
+
+        generic_double_major = (
+            "This plan covers Biology and Computer Science.\n"
+            "Semester 1:\n"
+            "- BIOL 110: Biology: Basic Concepts and Biodiversity (prerequisites: None)\n"
+            "- CMPSC 131: Programming and Computation I (prerequisites: None)\n"
+            "Total Credits: 7"
+        )
+
+        detail = _validate_multi_major_coverage(
+            generic_double_major,
+            ["Biology", "Computer Science"],
+        )
+        self.assertIsNotNone(detail)
+        self.assertIn("without a major label", detail)
 
     def test_validator_passes_when_both_majors_named(self):
         from orchestration_pipeline import _validate_multi_major_coverage

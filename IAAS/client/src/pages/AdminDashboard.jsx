@@ -1,9 +1,8 @@
 import React, { useState } from 'react';
-import axios from 'axios';
 import { useNavigate } from 'react-router-dom';
-import { Input } from '@mui/material';
+import { registerUser } from '../services/apiService';
 
-const AdminDashboard = ({ onRegister }) => {
+const AdminDashboard = () => {
     const [name, setName] = useState('');
     const [sex, setSex] = useState('');
     const [dateOfBirth, setDateOfBirth] = useState('');
@@ -27,10 +26,14 @@ const AdminDashboard = ({ onRegister }) => {
 
 
         try {
-            const response = await axios.post('/api/register', { name, email, password, role, sex, dateOfBirth });
+            if (!role) {
+                setError('Role is required');
+                return;
+            }
 
-            setSuccess(response.data.message);
-            localStorage.setItem('token', response.data.token);
+            const response = await registerUser({ name, email, password, role, sex, dateOfBirth });
+
+            setSuccess(response.message);
             setName('');
             setEmail('');
             setPassword('');
@@ -39,7 +42,7 @@ const AdminDashboard = ({ onRegister }) => {
             setSex('');
             navigate('/login');
         } catch (err) {
-            setError(err.response?.data?.error || 'Registration failed');
+            setError(err.message || 'Registration failed');
         }
     };
 

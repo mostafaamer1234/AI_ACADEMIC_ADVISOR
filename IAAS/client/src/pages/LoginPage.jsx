@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
-import axios from 'axios';
-import { Link, useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
+import { loginUser } from '../services/apiService';
 
-const LoginPage = ({ onLogin }) => {
+const LoginPage = ({ onLogin = () => {} }) => {
     const [email, setEmail] = useState('');
     const [password, setPassword] = useState('');
     const [error, setError] = useState('');
@@ -13,19 +13,19 @@ const LoginPage = ({ onLogin }) => {
         setError('');
 
         try {
-            const response = await axios.post('http://localhost:5001/api/login', { email, password });
-            const user = response.data.user;
+            const response = await loginUser({ email, password });
+            const user = response.user;
             onLogin(user);
-            localStorage.setItem('token', response.data.token);
+            localStorage.setItem('token', response.token);
             localStorage.setItem('role', user.role);
-            localStorage.setItem('user', JSON.stringify(response.data.user));
+            localStorage.setItem('user', JSON.stringify(user));
 
-            if (user.role === 'student') navigate('/student-dashboard');
+            if (user.role === 'student') navigate('/dashboard');
             else if (user.role === 'faculty') navigate('/faculty-dashboard');
             else if (user.role === 'admin') navigate('/admin-dashboard');
             else navigate('/dashboard');
         } catch (err) {
-            setError(err.response?.data?.error || 'Login failed');
+            setError(err.message || 'Login failed');
         }
     };
 

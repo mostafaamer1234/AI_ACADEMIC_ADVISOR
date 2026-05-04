@@ -25,13 +25,15 @@ from typing import List, Dict, Optional, Tuple, Any, Callable
 from urllib.parse import urlparse, urljoin
 import time as _dbg_time
 
-# #region debug log helper (debug session 97c192)
-_DBG_LOG_PATH = "/Users/mostafa/newFianlLLMRepo/.cursor/debug-97c192.log"
+_DBG_LOG_PATH = os.getenv("IAAS_DEBUG_LOG_PATH", "").strip()
+_DBG_SESSION_ID = os.getenv("IAAS_DEBUG_SESSION_ID", "local")
 def _dbg(hyp: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    if not _DBG_LOG_PATH:
+        return
     try:
         with open(_DBG_LOG_PATH, "a") as _f:
             _f.write(json.dumps({
-                "sessionId": "97c192",
+                "sessionId": _DBG_SESSION_ID,
                 "runId": "r1",
                 "hypothesisId": hyp,
                 "location": location,
@@ -41,7 +43,6 @@ def _dbg(hyp: str, location: str, message: str, data: Dict[str, Any]) -> None:
             }) + "\n")
     except Exception:
         pass
-# #endregion
 from html import unescape
 
 # Add current directory to Python path BEFORE importing local modules
@@ -62,16 +63,27 @@ import pandas as pd
 # Make sure local modules can be imported
 
 
-from graphExperiment import course_graph, get_course_prerequisites, get_major_course_codes
+from graphExperiment import (
+    build_course_catalog_index,
+    course_graph,
+    format_course_prerequisite_summary,
+    get_course_prerequisites,
+    get_major_course_codes,
+)
 from orchestration_pipeline import (
     ADVISOR_PERSONA,
+    AGENT_DISPLAY_NAME,
     ExecutorResult,
     OrchestrationPlan,
+    PRIVATE_REASONING_GUIDANCE,
     _canonical_path_for_domain,
     _canonical_tools_for_path,
+    canonicalize_semester_blocks,
     _parse_prereq_graph_text,
     _requires_grounded_answer,
+    _looks_like_plan_request,
     run_three_stage_pipeline,
+    sanitize_public_response,
 )
 from web_search_pipeline import (
     ResolvedResearchAnswer,
@@ -105,6 +117,7 @@ LLM_DIR = os.path.abspath(os.path.dirname(__file__))
 CHROMA_DATA_DIR = os.path.join(LLM_DIR, "chroma_data")
 COLLECTION_METADATA_FILE = os.path.join(CHROMA_DATA_DIR, "collection_metadata.json")
 POLICY_PDF_PATH = os.path.join(LLM_DIR, "PennState_Combined_Advising_and_Registrar_VERBATIM.pdf")
+COURSE_RETRIEVER_FORMAT_VERSION = "course-prereq-canonical-v2"
 
 # =========================
 # Helper Functions for Document Processing
@@ -1593,6 +1606,8 @@ def setup_environment(whatIfUpload=None, user_id='default'):
     
     if courses_csv_path and os.path.exists(courses_csv_path):
         df_courses = pd.read_csv(courses_csv_path)
+        catalog_codes = [str(c) for c in df_courses["course_number"].dropna().tolist()]
+        catalog_index = build_course_catalog_index(catalog_codes)
         course_texts = []
         course_metadata = []
 
@@ -1600,9 +1615,9 @@ def setup_environment(whatIfUpload=None, user_id='default'):
             course_text = f"Course: {row.get('course_number', '')}. "
             course_text += f"Title: {row.get('course_name', '')}. "
             course_text += f"Description: {row.get('description', '')}. "
-            prereq_str = str(row.get('prerequisite_course_numbers', ''))
-            if prereq_str and prereq_str != 'nan':
-                course_text += f"Prerequisites: {prereq_str}. "
+            prereq_summary = format_course_prerequisite_summary(row, catalog_codes=catalog_index)
+            if prereq_summary:
+                course_text += f"{prereq_summary} "
             course_texts.append(course_text)
             
             course_code = str(row.get('course_number', '')).strip()
@@ -1612,6 +1627,23 @@ def setup_environment(whatIfUpload=None, user_id='default'):
             })
         
         chroma_courses_dir = os.path.join(CHROMA_DATA_DIR, "courses")
+        course_fingerprint_path = os.path.join(chroma_courses_dir, ".source_fingerprint")
+        course_source_fingerprint = hashlib.sha256(
+            f"{COURSE_RETRIEVER_FORMAT_VERSION}:{get_document_hash(courses_csv_path)}".encode("utf-8")
+        ).hexdigest()
+        if os.path.exists(chroma_courses_dir):
+            existing_fingerprint = ""
+            if os.path.exists(course_fingerprint_path):
+                with open(course_fingerprint_path, "r", encoding="utf-8") as _fp:
+                    existing_fingerprint = _fp.read().strip()
+            if existing_fingerprint != course_source_fingerprint:
+                shutil.rmtree(chroma_courses_dir)
+
+        def _write_course_fingerprint():
+            os.makedirs(chroma_courses_dir, exist_ok=True)
+            with open(course_fingerprint_path, "w", encoding="utf-8") as _fp:
+                _fp.write(course_source_fingerprint)
+
         try:
             if os.path.exists(chroma_courses_dir):
                 try:
@@ -1634,6 +1666,7 @@ def setup_environment(whatIfUpload=None, user_id='default'):
                         persist_directory=chroma_courses_dir
                     )
                     vectorstore_courses.persist()
+                    _write_course_fingerprint()
                     print("✅ Created new course-level vectorstore.")
             else:
                 cached_embeddings = CachedEmbeddings(OpenAIEmbeddings())
@@ -1644,6 +1677,7 @@ def setup_environment(whatIfUpload=None, user_id='default'):
                     persist_directory=chroma_courses_dir
                 )
                 vectorstore_courses.persist()
+                _write_course_fingerprint()
                 print("✅ Created new course-level vectorstore.")
         except Exception as e:
             print(f"⚠️ Error with course vectorstore: {e}")
@@ -1657,6 +1691,7 @@ def setup_environment(whatIfUpload=None, user_id='default'):
                 persist_directory=chroma_courses_dir
             )
             vectorstore_courses.persist()
+            _write_course_fingerprint()
 
         course_retriever = vectorstore_courses.as_retriever(search_kwargs={"k": 5})
         print("✅ Course-level vectorstore initialized.")
@@ -2215,7 +2250,7 @@ def _classify_intent_llm(
     user_question: str,
     has_transcript: bool,
     conversation_history: Optional[List[dict]] = None,
-) -> str:
+) -> Optional[str]:
     """
     Use LLM to classify user intent when keyword routing is ambiguous.
     Returns route type: 'course', 'major', 'transcript', 'policy', or 'chat'
@@ -2226,7 +2261,7 @@ def _classify_intent_llm(
             from langchain_openai import ChatOpenAI
             llm_classifier = ChatOpenAI(model_name=CLASSIFIER_MODEL_NAME, temperature=0)
         except Exception:
-            return "chat"
+            return None
 
     recent_context = ""
     if conversation_history and len(conversation_history) > 0:
@@ -2235,34 +2270,81 @@ def _classify_intent_llm(
             f"{m.get('role', '')}: {str(m.get('content', ''))[:80]}..." for m in recent
         )
 
-    prompt = f"""Classify the student's intent. Reply with ONLY one word from this exact list:
-transcript_review, graduation_plan, policy, course_info, major_requirements, general_chat
-
-Definitions:
-- transcript_review: Student wants you to REVIEW/ANALYZE their academic record (e.g., "audit my requirements", "review my transcript", "check my progress", "go through my record", "where do I stand")
-- graduation_plan: Student wants a semester-by-semester graduation plan
-- policy: Student asks about institutional processes/rules (e.g., "how do I audit a course?", "drop deadline", "withdraw policy")
-- course_info: Student asks about a specific course (prerequisites, description)
-- major_requirements: Student asks what courses a major requires (general catalog, not their own record)
-- general_chat: Other questions
-
-Student has transcript uploaded: {has_transcript}
+    system_prompt = (
+        "You are an intent classifier for a Penn State Abington advising assistant. "
+        "Classify the student's message into exactly one routing label.\n\n"
+        + PRIVATE_REASONING_GUIDANCE
+        + "\n\nOutput contract:\n"
+        "- Return ONLY one lowercase label from this list: transcript_review, graduation_plan, policy, "
+        "course_info, major_requirements, general_chat.\n"
+        "- Do not return JSON, markdown, punctuation, confidence, or explanation.\n\n"
+        "Label definitions with examples:\n"
+        "- transcript_review: The student wants their academic record reviewed or audited. "
+        "Examples: 'audit my requirements', 'review my transcript', 'where do I stand?'.\n"
+        "- graduation_plan: The student wants a semester-by-semester graduation plan or course schedule. "
+        "Examples: 'make me a graduation plan', 'what should I take next semester?'.\n"
+        "- policy: The student asks about institutional rules, deadlines, or processes. "
+        "Examples: 'late drop deadline', 'how do I audit a course?', 'withdraw policy'.\n"
+        "- course_info: The student asks about a specific course's prerequisites, title, description, or role. "
+        "Examples: 'what are CMPSC 488 prereqs?', 'what is ENGL 15?'.\n"
+        "- major_requirements: The student asks what a major requires in general, not their personal record. "
+        "Examples: 'what courses are required for Computer Science?', 'Business major prescribed courses'.\n"
+        "- general_chat: Anything else or unclear intent. Example: 'thanks', 'can you explain that?'."
+    )
+    prompt = f"""Student has transcript uploaded: {has_transcript}
 {recent_context}
 
 Question: "{user_question}"
 
-Intent:"""
+Return one label:"""
 
     try:
-        result = llm_classifier.invoke([HumanMessage(content=prompt)]).content.strip().lower()
+        result = llm_classifier.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=prompt),
+        ]).content.strip().lower()
         # Extract first valid intent if LLM added extra text
         for intent in INTENT_TO_ROUTE:
             if intent in result:
                 return INTENT_TO_ROUTE[intent]
-        return "chat"
+        return None
     except Exception as e:
         print(f"⚠️ Intent classification failed: {e}")
-        return "chat"
+        return None
+
+
+def _route_query_deterministic_fallback(
+    user_question: str,
+    has_transcript: bool = False,
+    conversation_history: Optional[List[dict]] = None,
+) -> str:
+    """Last-resort route when the LLM classifier is unavailable or invalid."""
+    question_lower = user_question.lower()
+
+    # Course-code detection is only a fallback; the LLM route owns normal flow.
+    if re.search(r'\b[A-Z]{2,}\s+\d{3}[A-Z]?\b', user_question, re.IGNORECASE):
+        return 'course'
+
+    transcript_terms = [
+        'graduation plan', 'generate plan', 'create plan', 'semester plan',
+        'my transcript', 'my courses', 'what do i need', 'generate plan',
+        'my academic', 'my requirements', 'my progress', 'my record',
+        'next semester', 'upcoming semester', 'what should i take next',
+        'recommend courses', 'recommend me courses',
+        'audit my document', 'audit my transcript', 'audit my academic requirements',
+    ]
+    if any(term in question_lower for term in transcript_terms):
+        return 'transcript'
+
+    year_terms = ['freshman', 'sophomore', 'junior', 'senior', 'first-year', 'second-year', 'third-year', 'fourth-year']
+    major_terms = ['computer science', 'biology', 'business', 'psychology', 'engineering', 'math', 'chemistry', 'physics', 'major', 'studying']
+    if any(y in question_lower for y in year_terms) and any(m in question_lower for m in major_terms):
+        return 'transcript'
+
+    if any(term in question_lower for term in ['major requirement', 'major courses', 'prescribed', 'option', 'what courses do i need for']):
+        return 'major'
+
+    return 'chat'
 
 
 def route_query(
@@ -2271,40 +2353,13 @@ def route_query(
     conversation_history: Optional[List[dict]] = None,
 ) -> str:
     """
-    Hybrid routing: keywords first for clear cases, LLM classification when ambiguous.
+    LLM-first routing with deterministic fallback only when classification fails.
     Returns: 'course', 'major', 'transcript', 'policy', or 'chat'
     """
-    question_lower = user_question.lower()
-
-    # 1. Clear: Course code pattern (e.g., "CMPSC 131", "MATH 140")
-    if re.search(r'\b[A-Z]{2,}\s+\d{3}[A-Z]?\b', user_question, re.IGNORECASE):
-        return 'course'
-
-    # 2. Clear: Strong transcript/planning keywords
-    strong_transcript_terms = [
-        'graduation plan', 'generate plan', 'create plan', 'semester plan',
-        'my transcript', 'my courses', 'what do i need', 'generate plan',
-        'my academic', 'my requirements', 'my progress', 'my record',
-        'next semester', 'upcoming semester', 'what should i take next',
-        'recommend courses', 'recommend me courses',
-        'audit my document', 'audit my transcript', 'audit my academic requirements',
-    ]
-    if any(term in question_lower for term in strong_transcript_terms):
-        return 'transcript'
-
-    # 3. Clear: Year + major (planning intent)
-    year_terms = ['freshman', 'sophomore', 'junior', 'senior', 'first-year', 'second-year', 'third-year', 'fourth-year']
-    major_terms = ['computer science', 'biology', 'business', 'psychology', 'engineering', 'math', 'chemistry', 'physics', 'major', 'studying']
-    if any(y in question_lower for y in year_terms) and any(m in question_lower for m in major_terms):
-        return 'transcript'
-
-    # 4. Clear: Major requirements (catalog lookup, not personal)
-    if any(term in question_lower for term in ['major requirement', 'major courses', 'prescribed', 'option', 'what courses do i need for']):
-        return 'major'
-
-    # 5. Ambiguous: use LLM to classify (handles policy vs transcript_review, etc.)
-    # e.g. "audit my requirements" -> transcript_review; "how do I audit a course?" -> policy
-    return _classify_intent_llm(user_question, has_transcript, conversation_history)
+    classified_route = _classify_intent_llm(user_question, has_transcript, conversation_history)
+    if classified_route:
+        return classified_route
+    return _route_query_deterministic_fallback(user_question, has_transcript, conversation_history)
 
 
 def _extract_requested_semesters(user_question: str, conversation_history: Optional[List[dict]] = None) -> int:
@@ -2452,42 +2507,63 @@ def _build_reasoning_plan(
             f"{m.get('role', 'user')}: {str(m.get('content', ''))[:150]}" for m in recent
         )
 
-    system_prompt = """You are a reasoning layer for an academic advising chatbot. Given the student's question and context, output a JSON object with these exact keys:
-
-- First analyze the user quesry and what they mean by it based on context and coversation history {recent_context}.
-- Then based on the analysis, determine the intent of the user.
-- If the intent is not clear, return "chat".
-- Then based on the intent, determine the needed data, delivery method nd tools rerquired
-
-intent: One of: recommendation, audit, full_plan, policy, course, major, transcript, chat
-  - recommendation: Student wants course recommendations for next/upcoming semester(s)
-  - audit: Student wants to review/analyze their transcript or academic requirements
-  - full_plan: Student wants a full semester-by-semester graduation plan
-  - policy: Institutional rules (deadlines, drop policy, etc.)
-  - course: Specific course info (prereqs, description)
-  - major: Major requirements (catalog lookup)
-  - transcript: Other transcript/planning requests
-  - chat: General questions
-
-- needed_data: Array of strings. Use ["transcript_plan_state"] for recommendation, ["transcript_summary","unmet_requirements"] for audit, ["transcript_or_major_year"] for full_plan, [] otherwise.
-
-- delivery: One of: semester_recommendations, detailed_but_concise_audit, full_semester_plan, default
-  - Match delivery to intent: semester_recommendations for recommendation, detailed_but_concise_audit for audit, full_semester_plan for full_plan, default otherwise.
-
-- semester_horizon: Integer 0-8. Use 1-2 for recommendation (how many semesters ahead), 8 for full_plan, 0 otherwise.
-
-- tools: Object with local_retrievers (boolean, usually true) and web_search (boolean).
-  - web_search: true for policy/academic questions that may need current info; false for transcript-based intents.
-
-- web_search_mode: One of: never, if_missing, verify_current_fact, verify_date
-  - never: For recommendation, audit, full_plan
-  - verify_date: For deadline/date questions (late drop, withdraw)
-  - verify_current_fact: For time-sensitive factual questions
-  - if_missing: For general policy/academic questions
-
-- contextual_question: A refined version of the question for retrieval. For vague follow-ups about deadlines, include prior context. Otherwise use the question as-is.
-
-Output ONLY valid JSON, no markdown or extra text."""
+    system_prompt = (
+        "You are the REASONING ROUTER for a Penn State Abington advising chatbot. "
+        "Your job is to classify the student's intent and decide what data the response pipeline needs.\n\n"
+        + PRIVATE_REASONING_GUIDANCE
+        + "\n\nOutput contract:\n"
+        "- Return ONLY valid JSON. No markdown, no code fence, no comments, no prose before or after.\n"
+        "- Use exactly these keys: intent, needed_data, delivery, semester_horizon, tools, web_search_mode, "
+        "contextual_question.\n\n"
+        "Private decision checklist (do not reveal):\n"
+        "1. Read the current question and recent conversation together.\n"
+        "2. Resolve vague follow-ups by carrying forward the latest relevant topic.\n"
+        "3. Pick the narrowest intent that can answer the student safely.\n"
+        "4. Decide whether transcript state, retrievers, or web search are required.\n"
+        "5. Set a delivery shape and semester horizon consistent with the user's wording.\n\n"
+        "intent values and examples:\n"
+        "- recommendation: Student wants course recommendations for next/upcoming semester(s). "
+        "Example: 'what should I take next semester?'.\n"
+        "- audit: Student wants review/analysis of their transcript or requirements. "
+        "Example: 'audit my transcript'.\n"
+        "- full_plan: Student wants a full semester-by-semester graduation plan. "
+        "Example: 'give me a full graduation plan'.\n"
+        "- policy: Institutional rules, dates, procedures, or deadlines. "
+        "Example: 'what is the late drop deadline?'.\n"
+        "- course: Specific course info such as prerequisites, description, title, or credits. "
+        "Example: 'what are CMPSC 488 prerequisites?'.\n"
+        "- major: General catalog major requirements, not personal transcript review. "
+        "Example: 'what does the Computer Science major require?'.\n"
+        "- transcript: Other transcript/planning requests. Example: 'how many credits do I have left?'.\n"
+        "- chat: General or unclear questions. Example: 'thanks' or 'can you explain?'.\n\n"
+        "needed_data examples:\n"
+        "- recommendation -> [\"transcript_plan_state\"].\n"
+        "- audit -> [\"transcript_summary\", \"unmet_requirements\"].\n"
+        "- full_plan -> [\"transcript_or_major_year\"].\n"
+        "- policy/course/major/chat -> [] unless the question explicitly needs transcript context.\n\n"
+        "delivery values and examples:\n"
+        "- semester_recommendations for recommendation.\n"
+        "- detailed_but_concise_audit for audit.\n"
+        "- full_semester_plan for full_plan.\n"
+        "- default otherwise.\n\n"
+        "semester_horizon examples:\n"
+        "- 'next semester' -> 1.\n"
+        "- 'next two semesters' -> 2.\n"
+        "- 'full graduation plan' -> 8.\n"
+        "- policy/course/major/chat -> 0.\n\n"
+        "tools object:\n"
+        "- local_retrievers: usually true for academic questions. Example: course prerequisites need local_retrievers=true.\n"
+        "- web_search: true when policy/date/current information may need verification. Example: deadline questions need web_search=true.\n\n"
+        "web_search_mode values and examples:\n"
+        "- never: recommendation, audit, full_plan.\n"
+        "- verify_date: deadline/date questions such as late drop, withdrawal, registration windows.\n"
+        "- verify_current_fact: time-sensitive factual questions.\n"
+        "- if_missing: general policy/academic questions where local data may be incomplete.\n\n"
+        "contextual_question examples:\n"
+        "- If the student asks 'what about the deadline?' after discussing late drop, write "
+        "'What is the late drop deadline?'.\n"
+        "- If the question is already clear, copy it with typo fixes only."
+    )
 
     user_prompt = f"""Student has transcript uploaded: {has_transcript}
 {recent_context}
@@ -2630,6 +2706,7 @@ def _format_course_for_display(course: str) -> str:
 def _format_plan_structure(plan_structure: dict, start_semester_number: int = 1) -> str:
     semesters = plan_structure.get("semesters", []) if plan_structure else []
     prereq_map = plan_structure.get("prerequisites", {}) if plan_structure else {}
+    course_titles = plan_structure.get("course_titles", {}) if plan_structure else {}
     if not semesters:
         return "I couldn't generate a semester plan. Please try again or upload your transcript."
     lines = []
@@ -2641,6 +2718,9 @@ def _format_plan_structure(plan_structure: dict, start_semester_number: int = 1)
             prereqs = prereq_map.get(course, []) or []
             prereq_text = ", ".join(_format_course_for_display(p) for p in prereqs) if prereqs else "None"
             display_course = _format_course_for_display(course)
+            course_title = str(course_titles.get(course) or course_titles.get(str(course).upper()) or "").strip()
+            if course_title and display_course == course:
+                display_course = f"{display_course}: {course_title}"
             lines.append(f"{display_course} (prerequisites: {prereq_text})")
         lines.append(f"Total Credits: {sem.get('credits', len(courses) * 3)}")
         lines.append("---")
@@ -2662,6 +2742,7 @@ def _slice_plan_structure(plan_structure: dict, semester_horizon: int) -> dict:
 def _extract_semester_blocks_from_text(plan_text: str) -> List[str]:
     if not plan_text:
         return []
+    plan_text = canonicalize_semester_blocks(plan_text)
     matches = re.finditer(
         r"((?:[-*]\s*)?(?:\*\*)?Semester\s+\+?\d+:(?:\*\*)?\s*\n.*?(?:[-*]\s*)?(?:\*\*)?Total Credits:(?:\*\*)?\s*\d+)",
         plan_text,
@@ -3007,10 +3088,19 @@ def aggregate_and_generate_response(user_question=None):
         try:
             transcript_context = "\n".join(doc.page_content[:500] for doc in stored_pdf_docs[:3])
             major_extraction = llm1.invoke([
-                SystemMessage(content="Extract the student's major name from the transcript. Return ONLY the full major name as it appears in university records (e.g., 'Computer Science, B.S. (Abington)')."),
-                HumanMessage(content=f"Extract major from: {transcript_context[:1000]}")
+                SystemMessage(content=(
+                    "You are a precise transcript information extractor. Extract ONLY the student's declared "
+                    "major from the transcript excerpt.\n\n"
+                    + PRIVATE_REASONING_GUIDANCE
+                    + "\n\nOutput contract:\n"
+                    "- Return only the full major name, no label and no explanation.\n"
+                    "- Prefer the exact university wording when visible. Example output: "
+                    "Computer Science, B.S. (Abington)\n"
+                    "- If no major is visible, return UNKNOWN."
+                )),
+                HumanMessage(content=f"Transcript excerpt:\n{transcript_context[:1000]}\n\nMajor:")
             ]).content.strip()
-            if major_extraction:
+            if major_extraction and major_extraction.strip().upper() != "UNKNOWN":
                 student_data["major"] = normalize_major_name(major_extraction)
         except:
             pass
@@ -3172,38 +3262,59 @@ def extract_major_and_year_from_text(user_text, conversation_history):
         common_majors = [m for m in available_majors if any(x in m.lower() for x in ['computer', 'biology', 'business', 'psychology', 'mathematics'])][:10]
         other_majors = [m for m in available_majors if m not in common_majors][:10]
         
-        extraction_prompt = f"""Extract the student's major and year level from their message.
+        extraction_prompt = f"""Task: Extract the student's major and year level from the current message and recent conversation.
 
-Common majors: {', '.join(common_majors)}
-Other majors available: {', '.join(other_majors)}
+Available major examples:
+- Common majors: {', '.join(common_majors)}
+- Other available majors: {', '.join(other_majors)}
 
-Year levels: freshman, sophomore, junior, senior (or first-year, second-year, etc.)
+Allowed year values:
+- freshman
+- sophomore
+- junior
+- senior
+- UNKNOWN
 
-Student message: "{user_text}"
+Current student message:
+"{user_text}"
 {history_context}
 
-CRITICAL INSTRUCTIONS:
-1. Look carefully for year level words: "freshman", "sophomore", "junior", "senior", "first-year", "second-year", etc.
-2. Even if the student says "I am a freshman" or "I am a computer science major freshman", extract BOTH the major AND the year.
-3. The year might appear anywhere in the message or conversation history.
+Extraction rules:
+1. Reason privately across the current message and conversation history.
+2. Extract BOTH fields when both are present, even if grammar is messy.
+3. Map first-year/1st year -> freshman, second-year/2nd year -> sophomore, third-year/3rd year -> junior, fourth-year/4th year -> senior.
+4. Use the closest listed major name when the student uses an abbreviation such as CS, bio, psych, or business.
+5. If a field is not supported by the message or history, return UNKNOWN for that field.
 
-IMPORTANT: Respond ONLY in this exact format (one line, no other text):
-MAJOR: [exact major name from list, or closest match]
-YEAR: [freshman OR sophomore OR junior OR senior]
+Output contract:
+Return exactly two lines and no extra text:
+MAJOR: [exact major name from list, closest listed major, or UNKNOWN]
+YEAR: [freshman OR sophomore OR junior OR senior OR UNKNOWN]
 
 Examples:
-- "I'm a computer science freshman" → MAJOR: Computer Science, B.S. (Abington) YEAR: freshman
-- "I am a computer science. major freshman, give me a graduation plan" → MAJOR: Computer Science, B.S. (Abington) YEAR: freshman
-- "I am a freshman studying computer science" → MAJOR: Computer Science, B.S. (Abington) YEAR: freshman
-- "biology sophomore" → MAJOR: Biology, B.S. (Abington) YEAR: sophomore
-- "business junior" → MAJOR: Business, B.S. (Abington) YEAR: junior
+Student: "I'm a computer science freshman"
+MAJOR: Computer Science, B.S. (Abington)
+YEAR: freshman
 
-If you cannot determine, use:
+Student: "biology sophomore"
+MAJOR: Biology, B.S. (Abington)
+YEAR: sophomore
+
+Student: "I'm a first year psych major"
+MAJOR: Psychological and Social Sciences, B.A. (Abington)
+YEAR: freshman
+
+Student: "give me a plan"
 MAJOR: UNKNOWN
 YEAR: UNKNOWN"""
         
         extraction_result = llm1.invoke([
-            SystemMessage(content="You are a precise information extractor. Extract major and year level from student messages."),
+            SystemMessage(content=(
+                "You are a precise information extractor for academic advising. "
+                "Extract only the requested fields from student text and recent conversation.\n\n"
+                + PRIVATE_REASONING_GUIDANCE
+                + "\n\nDo not infer unsupported facts. Return exactly the requested two-line format."
+            )),
             HumanMessage(content=extraction_prompt)
         ]).content
         
@@ -3681,9 +3792,27 @@ def _build_policy_lookup_draft(
                 response = llm2.invoke([
                     SystemMessage(content=(
                         ADVISOR_PERSONA
-                        + "\n\nFor this turn you are answering a Penn State policy question. "
-                        "Answer using ONLY the provided policy text. If the answer is not present in the "
-                        "context, say so explicitly (do not guess), and suggest the right office to contact."
+                        + "\n\nFor this turn you are the POLICY ANSWERER. Answer a Penn State policy, "
+                        "deadline, registration, or advising-process question using ONLY the provided policy text.\n\n"
+                        + PRIVATE_REASONING_GUIDANCE
+                        + "\n\nPrivate answer checklist (do not reveal):\n"
+                        "1. Identify the exact policy question and whether it asks for a date, process, eligibility, or office.\n"
+                        "2. Locate the supporting sentence(s) in the provided policy context.\n"
+                        "3. Answer only what the context supports.\n"
+                        "4. If the context does not answer it, say that plainly and suggest the correct office to contact.\n\n"
+                        "Output guidance with examples:\n"
+                        "- Direct supported answer: 'The available policy text says students should contact the Registrar for X.'\n"
+                        "- Missing answer: 'I do not see that deadline in the policy text provided here, so confirm it with the Registrar.'\n"
+                        "- Exact-date questions: include the concrete date only if it appears in the context. Example: "
+                        "'The late-drop deadline shown in the provided text is April 5, 2026.'\n\n"
+                        "Output contract:\n"
+                        "- Return student-facing prose only.\n"
+                        "- Put the direct answer first, then any grounded next steps.\n"
+                        "- Do not include JSON, markdown tables, internal notes, or private reasoning.\n\n"
+                        "Hard rules:\n"
+                        "- Do not guess dates, deadlines, URLs, office names, or policy details.\n"
+                        "- Do not cite internal retrieval mechanics.\n"
+                        "- Keep the answer concise, then add grounded next steps when helpful."
                     )),
                     HumanMessage(content=f"{_get_current_datetime_context()}\nPolicy context:\n{policy_context}\n\nQuestion: {contextual_question}"),
                 ]).content
@@ -4492,6 +4621,27 @@ def _build_major_lookup_draft(
             + "\n\nFor this turn you are the major-lookup synthesizer. You receive verified "
             "Penn State data below, organized into labeled sections. Ground every Penn State-specific "
             "claim in that data. Use exact course codes and titles as they appear there.\n\n"
+            + PRIVATE_REASONING_GUIDANCE
+            + "\n\nPrivate synthesis checklist (do not reveal):\n"
+            "1. Identify the requested major(s), semester horizon, student year, and whether transcript data is present.\n"
+            "2. List candidate courses only from the verified data.\n"
+            "3. Check prerequisite_graph before placing each course in a semester.\n"
+            "4. Fill gen-ed/elective buckets with categorized labels and examples when exact courses are not verified.\n"
+            "5. Confirm the response scope: one semester, multiple semesters, or direct major requirements.\n\n"
+            "Required semester block shape:\n"
+            "Semester N:\n"
+            "COURSE 123: Course Title (prerequisites: None)\n"
+            "COURSE 234: Course Title (prerequisites: COURSE 123)\n"
+            "Gen Ed (GH - Humanities) — examples: ART 001, HIST 148 (prerequisites: None)\n"
+            "Total Credits: 15\n\n"
+            "Good examples:\n"
+            "- 'PSU 1: First-Year Seminar Abington (prerequisites: None)' when PSU 1 appears in verified course data.\n"
+            "- 'CMPSC 488: Senior Project (prerequisites: CMPSC 487W)' only when prerequisite_graph supports that edge.\n"
+            "- 'Gen Ed (GQ - Quantification) — examples: STAT 200, MATH 110' when the exact bucket is known but the final choice needs advisor confirmation.\n\n"
+            "Bad examples:\n"
+            "- 'Elective' with no category or examples.\n"
+            "- 'CMPSC 132 (prerequisites: None)' when prerequisite_graph says CMPSC 131 is enforced.\n"
+            "- A quoted one-paragraph plan such as 'Semester 1: ... Total Credits: 15'.\n\n"
             "USER-FACING LANGUAGE RULE: never use internal terms in your answer. The student does not "
             "know what the following words mean and must NOT see them: 'retrieved bundle', 'retrieval', "
             "'retrieved', 'bundle', 'majors_retriever', 'course_retriever', 'prerequisite_graph', "
@@ -4540,7 +4690,7 @@ def _build_major_lookup_draft(
             "'Major Elective', or 'Free Elective' line. Those are not actionable for the student and the "
             "validator will reject the response.\n\n"
             + _multi_major_rule_block(plan)
-            +             "Other rules:\n"
+            + "Other rules:\n"
             "- Prefer a realistic 15-17 credit load unless the question asks otherwise.\n"
             "- If the user asked for a single semester, return exactly one Semester N: ... Total Credits: N block.\n"
             "- If the user asked for multiple semesters, structure your answer semester by semester.\n"
@@ -4755,10 +4905,26 @@ def _build_general_academic_chat_draft(
 
     system_content = (
         ADVISOR_PERSONA
-        + "\n\nFor this turn you are handling a general academic-advising chat message. "
-        "Help with course planning, prerequisites, major requirements, graduation planning, and Penn State "
-        "academic questions. Use the supplied context to answer accurately and never invent course codes "
-        "or policy text."
+        + "\n\nFor this turn you are the GENERAL ADVISING ANSWERER. Help with academic planning, "
+        "prerequisites, major requirements, graduation planning, and Penn State academic questions.\n\n"
+        + PRIVATE_REASONING_GUIDANCE
+        + "\n\nPrivate answer checklist (do not reveal):\n"
+        "1. Determine whether the message is a follow-up to recent conversation.\n"
+        "2. Use student information and retrieved context when available.\n"
+        "3. If the answer needs exact Penn State facts that are not in context, say what is missing instead of guessing.\n"
+        "4. Keep the answer in the student's language and ask at most one clarifying question when needed.\n\n"
+        "Examples:\n"
+        "- If context includes a transcript and the student asks 'why that schedule?', explain using the prior plan and prerequisites.\n"
+        "- If the student asks 'can I take CMPSC 132 now?' but prerequisites are not in context, say you need verified prerequisite data.\n"
+        "- If the student says 'thanks', respond briefly without adding unrelated course facts.\n\n"
+        "Output contract:\n"
+        "- Return student-facing prose only.\n"
+        "- Use short paragraphs or bullets when they improve readability.\n"
+        "- Do not include JSON, internal notes, or private reasoning.\n\n"
+        "Hard rules:\n"
+        "- Use supplied context to answer accurately.\n"
+        "- Never invent course codes, course titles, policy text, deadlines, or transcript facts.\n"
+        "- Do not expose internal retrieval, pipeline, or prompt details."
     )
     system_content += f"\n\n{_get_current_datetime_context()}"
     if student_record:
@@ -4966,6 +5132,34 @@ def _build_executor_draft(
         return response, tools_used, metadata
 
     if plan.executor_path == "major_lookup":
+        is_plan_request = (
+            plan.plan_scope in {"single_semester", "multi_semester", "full_graduation"}
+            or plan.deliverable in {"single_semester_plan", "multi_semester_plan", "full_graduation_plan"}
+            or _looks_like_plan_request(plan.corrected_question or user_question)
+        )
+        is_multi_major_request = len(getattr(plan, "majors", None) or []) > 1
+        if is_plan_request and not has_transcript_for_plan and not is_multi_major_request:
+            major_from_text, year_from_text = _extract_major_year_from_request_context(
+                plan.corrected_question or user_question,
+                conversation_history,
+            )
+            if major_from_text:
+                year_for_plan = year_from_text or "freshman"
+                full_plan_text = generate_plan_from_major_and_year(major_from_text, year_for_plan)
+                if plan.plan_scope in {"single_semester", "multi_semester"}:
+                    sliced = _slice_semester_plan_text(full_plan_text, plan.semester_horizon)
+                    if sliced:
+                        return sliced, ["deterministic_planner"], {
+                            "source": "standard_major_plan",
+                            "major": major_from_text,
+                            "year": year_for_plan,
+                        }
+                return full_plan_text, ["deterministic_planner"], {
+                    "source": "standard_major_plan",
+                    "major": major_from_text,
+                    "year": year_for_plan,
+                }
+
         # If the question pins a specific semester of the major
         # (e.g. "first semester CS", "3rd semester biology"), route to the
         # deterministic planner: with-transcript -> personalized next-semester
@@ -4974,7 +5168,7 @@ def _build_executor_draft(
         target_semester_request = _extract_target_semester_request(
             plan.corrected_question or user_question
         )
-        if target_semester_request is not None:
+        if target_semester_request is not None and not is_multi_major_request:
             response, tools_used, metadata = _build_semester_specific_major_draft(
                 user_question=plan.corrected_question or user_question,
                 target=target_semester_request,
@@ -5049,13 +5243,27 @@ def _run_executor_stage(
 
     system_prompt = (
         ADVISOR_PERSONA
-        + "\n\nFor this turn you are the executor stage. "
-        "Produce the core answer for the user based on the provided execution plan, conversation history, and supporting context. "
-        "Use your own reasoning to answer the question. "
-        "Treat helper outputs and drafts as supporting evidence, not as the only possible answer. "
-        "When no tools are required, answer directly from the conversation history and available context. "
-        "Preserve the requested scope exactly. "
-        "If the draft already contains semester blocks, preserve those blocks verbatim and do not add extra semesters."
+        + "\n\nFor this turn you are the EXECUTOR STAGE. Produce the core answer using the execution plan, "
+        "conversation history, supporting context, and draft answer.\n\n"
+        + PRIVATE_REASONING_GUIDANCE
+        + "\n\nPrivate execution checklist (do not reveal):\n"
+        "1. Confirm the execution plan's domain, deliverable, scope, and must_not_do list.\n"
+        "2. Compare the draft against supporting context and remove unsupported facts.\n"
+        "3. Preserve the requested scope exactly.\n"
+        "4. If semester blocks already exist in the draft, preserve their block count and structure.\n"
+        "5. If no tools are required, answer only from conversation history and available context.\n\n"
+        "Examples:\n"
+        "- Single-semester scope: return exactly one Semester N block, not a full 8-semester plan.\n"
+        "- Policy direct answer: answer the policy question and do not add unrelated course recommendations.\n"
+        "- Profile recall: if the student earlier said 'junior Computer Science', answer that directly without retrieval.\n\n"
+        "Output contract:\n"
+        "- Return the draft answer text only, improved for accuracy and scope.\n"
+        "- Do not return JSON, internal notes, or private reasoning.\n"
+        "- Preserve semester block formatting when present.\n\n"
+        "Hard rules:\n"
+        "- Treat helper outputs and drafts as evidence, but do not repeat unsupported or contradictory claims.\n"
+        "- If the draft already contains semester blocks, preserve those blocks VERBATIM and do not add extra semesters.\n"
+        "- Do not reveal private reasoning or internal pipeline details."
     )
     user_prompt = (
         f"{_get_current_datetime_context()}\n"
@@ -5134,6 +5342,34 @@ def _execute_orchestration_plan(
         },
     )
 
+
+_FOUL_LANGUAGE_TOPIC_RE = re.compile(
+    r"\b(?:profan(?:ity|e)|swear(?:ing)?|curse\s+words?|cuss(?:ing)?|foul\s+language|"
+    r"vulgar\s+language|obscene\s+wording|bad\s+words?|offensive\s+language)\b",
+    re.IGNORECASE,
+)
+_FOUL_LANGUAGE_REQUEST_RE = re.compile(
+    r"\b(?:say|write|use|give|list|generate|repeat|quote|translate|make|create|provide|"
+    r"approve|endorse|condone|justify|normalize|example|examples)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_foul_language_request(user_question: str) -> bool:
+    """Detect requests to produce or endorse foul language before calling the model."""
+    question = user_question or ""
+    if not _FOUL_LANGUAGE_TOPIC_RE.search(question):
+        return False
+    return bool(_FOUL_LANGUAGE_REQUEST_RE.search(question))
+
+
+def _foul_language_refusal() -> str:
+    return (
+        f"I can't help produce, repeat, approve, or endorse foul language. "
+        f"{AGENT_DISPLAY_NAME} will keep the wording professional and can help rephrase the idea respectfully."
+    )
+
+
 def generate_conversational_response(
     user_question,
     conversation_history,
@@ -5155,6 +5391,13 @@ def generate_conversational_response(
         "Request received",
         {"has_history": bool(conversation_history), "history_len": len(conversation_history or [])},
     )
+
+    if _is_foul_language_request(user_question):
+        refusal = sanitize_public_response(_foul_language_refusal())
+        trace["result_preview"] = refusal[:400]
+        trace["finished_at"] = datetime.now().isoformat()
+        execution_trace_store[user_id] = trace
+        return refusal
 
     if user_has_transcript is not None:
         has_transcript_for_plan = user_has_transcript and (stored_pdf_docs is not None)
@@ -5221,6 +5464,7 @@ def generate_conversational_response(
             validation_helpers=validation_helpers,
         )
         trace["plan"] = plan.to_dict()
+        final_response = sanitize_public_response(final_response)
         trace["result_preview"] = final_response[:400]
         trace["finished_at"] = datetime.now().isoformat()
         execution_trace_store[user_id] = trace
@@ -5230,6 +5474,7 @@ def generate_conversational_response(
         print(f"Error in conversational response pipeline: {e}")
         print(f"Traceback: {traceback.format_exc()}")
         fallback = "I apologize, but I encountered an error processing your question. Please try rephrasing it or ask a more specific academic advising question."
+        fallback = sanitize_public_response(fallback)
         trace["result_preview"] = fallback[:400]
         trace["finished_at"] = datetime.now().isoformat()
         execution_trace_store[user_id] = trace

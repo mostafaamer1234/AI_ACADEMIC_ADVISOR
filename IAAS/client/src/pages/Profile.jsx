@@ -16,7 +16,7 @@ import {
 } from '@mui/material';
 import EditIcon from '@mui/icons-material/Edit';
 
-const Profile = ({onLogout}) => {
+const Profile = ({ onLogout = () => {} }) => {
   const navigate = useNavigate();
   const [profilePic, setProfilePic] = useState('https://via.placeholder.com/150');
   const [name, setName] = useState('');

@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time as _dbg_time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-# #region debug log helper (debug session 97c192)
-_DBG_LOG_PATH = "/Users/mostafa/newFianlLLMRepo/.cursor/debug-97c192.log"
+_DBG_LOG_PATH = os.getenv("IAAS_DEBUG_LOG_PATH", "").strip()
+_DBG_SESSION_ID = os.getenv("IAAS_DEBUG_SESSION_ID", "local")
 def _dbg(hyp: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    if not _DBG_LOG_PATH:
+        return
     try:
         with open(_DBG_LOG_PATH, "a") as _f:
             _f.write(json.dumps({
-                "sessionId": "97c192",
+                "sessionId": _DBG_SESSION_ID,
                 "runId": "r1",
                 "hypothesisId": hyp,
                 "location": location,
@@ -23,7 +26,6 @@ def _dbg(hyp: str, location: str, message: str, data: Dict[str, Any]) -> None:
             }) + "\n")
     except Exception:
         pass
-# #endregion
 
 try:
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -37,10 +39,50 @@ except Exception:  # pragma: no cover - fallback for reduced test environments
         content: str
 
 
-COURSE_CODE_RE = re.compile(r"\b[A-Z]{2,}\s+\d{3}[A-Z]?\b", re.IGNORECASE)
+def _load_short_course_prefixes() -> Tuple[str, ...]:
+    """Prefixes that have real one- or two-digit course numbers in the catalog.
+
+    Broadly accepting ``WORD 3`` creates false positives for ordinary version
+    references such as ``Python 3.12``. Three-digit course numbers are common
+    enough to match generically, but short course numbers should be tied to the
+    catalog this advisor is grounded in.
+    """
+
+    prefixes = {"PSU", "ENGL", "ESL", "CAS", "ART", "SOC"}
+    catalog_path = os.path.join(os.path.dirname(__file__), "processed_psu_courses.csv")
+    try:
+        with open(catalog_path, "r", encoding="utf-8", errors="ignore") as catalog:
+            for line in catalog:
+                match = re.match(r"^\s*([A-Z]{2,8}(?:/[A-Z]{2,8})*)\s+(\d{1,2}[A-Z]?)\b", line)
+                if match:
+                    prefixes.add(match.group(1).upper())
+    except Exception:
+        pass
+    return tuple(sorted(prefixes, key=lambda value: (-len(value), value)))
+
+
+def _build_course_code_regex() -> re.Pattern:
+    classic_code = r"[A-Z]{2,8}(?:/[A-Z]{2,8})*\s+\d{3}[A-Z]?"
+    short_prefixes = "|".join(re.escape(prefix) for prefix in _load_short_course_prefixes())
+    if short_prefixes:
+        short_code = rf"(?:{short_prefixes})\s+\d{{1,2}}[A-Z]?"
+        return re.compile(rf"\b(?:{classic_code}|{short_code})\b", re.IGNORECASE)
+    return re.compile(rf"\b{classic_code}\b", re.IGNORECASE)
+
+
+COURSE_CODE_RE = _build_course_code_regex()
 SEMESTER_BLOCK_RE = re.compile(
     r"((?:[-*]\s*)?(?:\*\*)?Semester\s+\+?\d+:(?:\*\*)?\s*\n.*?(?:[-*]\s*)?(?:\*\*)?Total Credits:(?:\*\*)?\s*\d+)",
     flags=re.IGNORECASE | re.DOTALL,
+)
+COMPACT_SEMESTER_LINE_RE = re.compile(
+    r'^\s*["\']?\s*(Semester\s+\+?\d+)\s*:\s*(.*?)\s*Total\s+Credits?\s*:\s*([\d.]+)\s*["\']?\s*$',
+    flags=re.IGNORECASE,
+)
+COMPACT_SEMESTER_ITEM_START_RE = re.compile(
+    r"(?=\b(?:[A-Z]{2,8}(?:/[A-Z]{2,8})?\s+\d{1,3}[A-Z]?\s*(?::|\(prerequisites?:)|"
+    r"(?:GQ|GN|GH|GS|GA|GWS|GHW|US|IL)\s+course\b|Open\s+slot\b|Free\s+Elective\b|Option\s+Elective\b))",
+    flags=re.IGNORECASE,
 )
 
 VALID_DOMAINS = {
@@ -231,6 +273,7 @@ def _extract_requested_horizon(text: str) -> int:
 def _extract_semester_blocks(plan_text: str) -> List[str]:
     if not plan_text:
         return []
+    plan_text = canonicalize_semester_blocks(plan_text)
     matches = list(SEMESTER_BLOCK_RE.finditer(plan_text))
     blocks: List[str] = []
     for match in matches:
@@ -238,6 +281,40 @@ def _extract_semester_blocks(plan_text: str) -> List[str]:
         if block:
             blocks.append(block)
     return blocks
+
+
+def _split_compact_semester_items(body: str) -> List[str]:
+    starts = [m.start() for m in COMPACT_SEMESTER_ITEM_START_RE.finditer(body or "")]
+    if not starts:
+        return [body.strip()] if body and body.strip() else []
+    if starts[0] != 0 and body[:starts[0]].strip(" ;,-"):
+        starts = [0] + starts
+    items: List[str] = []
+    for idx, start in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else len(body)
+        item = body[start:end].strip(" ;")
+        if item:
+            items.append(item)
+    return items
+
+
+def canonicalize_semester_blocks(text: str) -> str:
+    """Normalize compact/quoted semester lines into parser-friendly blocks."""
+    if not isinstance(text, str) or not text:
+        return text
+    out: List[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        match = COMPACT_SEMESTER_LINE_RE.match(line)
+        if not match:
+            out.append(raw_line)
+            continue
+        semester, body, credits = match.groups()
+        out.append(f"{semester}:")
+        for item in _split_compact_semester_items(body):
+            out.append(f"- {item}")
+        out.append(f"Total Credits: {credits}")
+    return "\n".join(out)
 
 
 def _is_profile_recall_question(text: str) -> bool:
@@ -384,23 +461,86 @@ def _looks_like_plan_request(text: str) -> bool:
 # semester-block preservation) trips PersonalityRegressionTests.
 # ---------------------------------------------------------------------------
 
+PRIVATE_REASONING_GUIDANCE = (
+    "Reason privately before writing: identify the student's intent, the evidence you are allowed to use, "
+    "the constraints that must not be violated, the missing information, and the required output shape. "
+    "Do not reveal private chain-of-thought. If useful, provide only a brief user-facing rationale or "
+    "evidence summary, not the hidden reasoning steps."
+)
+
+AGENT_DISPLAY_NAME = "Leo"
+
+LANGUAGE_SAFETY_POLICY = (
+    "Identity and language safety:\n"
+    f"- Your name is {AGENT_DISPLAY_NAME}. When referring to yourself, use {AGENT_DISPLAY_NAME}.\n"
+    "- Never write, quote, list, transform, repeat, normalize, praise, or endorse profanity, foul language, "
+    "vulgar insults, slurs, or obscene wording, even if the student requests it.\n"
+    "- If the student asks for foul language, asks you to approve it, or tries to force that style, politely "
+    "decline in clean professional wording and redirect to respectful phrasing.\n"
+    "- Preserve course titles, policy names, and cited source text only when they are clean. If source text "
+    "contains foul language, summarize it neutrally without repeating the wording.\n"
+)
+
+_PROFANITY_PATTERNS = [
+    re.compile(r"\bf[\W_]*u[\W_]*c[\W_]*k(?:[\W_]*(?:e[\W_]*d|i[\W_]*n[\W_]*g|s|e[\W_]*r))?\b", re.IGNORECASE),
+    re.compile(r"\bs[\W_]*h[\W_]*i[\W_]*t(?:[\W_]*(?:t[\W_]*y|s))?\b", re.IGNORECASE),
+    re.compile(r"\bb[\W_]*i[\W_]*t[\W_]*c[\W_]*h(?:[\W_]*(?:e[\W_]*s|y))?\b", re.IGNORECASE),
+    re.compile(r"\ba[\W_]*s[\W_]*s[\W_]*h[\W_]*o[\W_]*l[\W_]*e(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bb[\W_]*a[\W_]*s[\W_]*t[\W_]*a[\W_]*r[\W_]*d(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bd[\W_]*a[\W_]*m[\W_]*n(?:[\W_]*(?:e[\W_]*d|i[\W_]*t))?\b", re.IGNORECASE),
+    re.compile(r"\bh[\W_]*e[\W_]*l[\W_]*l\b", re.IGNORECASE),
+    re.compile(r"\bc[\W_]*r[\W_]*a[\W_]*p\b", re.IGNORECASE),
+    re.compile(r"\bp[\W_]*i[\W_]*s[\W_]*s(?:[\W_]*(?:e[\W_]*d|i[\W_]*n[\W_]*g))?\b", re.IGNORECASE),
+    re.compile(r"\bd[\W_]*i[\W_]*c[\W_]*k(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bc[\W_]*u[\W_]*n[\W_]*t(?:s)?\b", re.IGNORECASE),
+    re.compile(r"\bp[\W_]*u[\W_]*s[\W_]*s[\W_]*y(?:ies)?\b", re.IGNORECASE),
+    re.compile(r"\bc[\W_]*o[\W_]*c[\W_]*k(?:s)?\b", re.IGNORECASE),
+]
+
+
+def sanitize_public_response(text: str) -> str:
+    """Remove foul language from any student-facing response."""
+    sanitized = str(text or "")
+    for pattern in _PROFANITY_PATTERNS:
+        sanitized = pattern.sub("[removed]", sanitized)
+    sanitized = re.sub(r"(?:\[removed\][\s,;:.!?-]*){2,}", "[removed] ", sanitized)
+    return sanitized.strip()
+
+
 ADVISOR_PERSONA = (
-    "You are an academic advisor for Penn State Abington students. "
-    "Voice: professional, warm, encouraging, and genuinely curious about the student's goals. "
+    f"You are {AGENT_DISPLAY_NAME}, an academic advisor for Penn State Abington students. Your job is to give students clear, "
+    "accurate, encouraging guidance they can act on.\n\n"
+    + LANGUAGE_SAFETY_POLICY
+    + "\n"
+    "Voice and tone:\n"
+    "- Professional, warm, encouraging, direct, and genuinely curious about the student's goals.\n"
+    "- Write like a helpful advisor, not like an internal system. Avoid internal tool names, implementation "
+    "details, or phrases such as 'retrieved bundle' and 'validator'.\n"
+    "- Be concise when the answer is simple; be more structured when the student asks for a plan, audit, "
+    "policy answer, or comparison.\n\n"
     "Behavior contract:\n"
-    "- Help maximally: always include related details the student didn't ask for but would benefit from "
-    "(prerequisite reminders, gen-ed tags, registration windows, advising office hours, related courses, "
-    "scholarships/programs that fit). Add these as a short 'Things to consider next' section after the "
-    "main answer (3-5 bullets, only items grounded in the draft or retrieved context).\n"
-    "- Encourage and motivate: acknowledge what the student is working toward and reinforce realistic "
-    "next steps. Avoid hedging that sounds discouraging.\n"
-    "- Soft-ask when info is missing: when a critical piece (transcript, major, year, course code) would "
-    "meaningfully change the answer, still give the best response possible with what you have, then end "
-    "with ONE specific clarifying question. Skip the question if the same one was already asked recently.\n"
-    "- Stay grounded: only mention specific course codes, deadlines, or policy text that appear in the "
-    "draft or the retrieved context. Never invent.\n"
-    "- Keep machine-readable blocks intact: any 'Semester N: ... Total Credits: N' block must be quoted "
-    "verbatim and never wrapped, split, or paraphrased.\n"
+    "- Grounded answer rule: only mention specific course codes, course titles, deadlines, policies, degree "
+    "requirements, or offices that appear in the draft, retrieved context, verified graph data, transcript "
+    "state, or current web evidence. Never invent missing facts.\n"
+    "- Help maximally: when grounded information is available, include related details the student would "
+    "benefit from, such as prerequisites, gen-ed tags, registration timing, advising office next steps, "
+    "related courses, or relevant programs. Add these as a short 'Things to consider next' section after "
+    "the main answer, usually 3-5 bullets.\n"
+    "- Encourage and motivate: acknowledge what the student is trying to accomplish and reinforce realistic "
+    "next steps. Do not overpromise or use discouraging hedges.\n"
+    "- Soft-ask behavior: when a critical missing piece such as transcript, major, year, campus, semester, "
+    "or course code would meaningfully change the answer, still provide the best grounded answer possible, "
+    "then end with ONE specific clarifying question. Skip the question if the same one was already asked "
+    "recently.\n"
+    "- Semester plan preservation: any 'Semester N: ... Total Credits: N' block must be preserved VERBATIM "
+    "as a standalone block and never quoted, wrapped, collapsed, or paraphrased.\n\n"
+    "Examples:\n"
+    "- Good soft-ask: 'I can sketch a standard Computer Science path, but your transcript would change the "
+    "ordering. What year are you currently in?'\n"
+    "- Good grounded caveat: 'I do not see an approved course list for that gen-ed bucket in the available "
+    "data, so confirm that slot with your advisor.'\n"
+    "- Bad behavior: inventing a prerequisite, adding a deadline without evidence, or turning a semester "
+    "block into one quoted paragraph."
 )
 
 
@@ -661,7 +801,7 @@ def _ensure_per_major_catalog_steps(
 ) -> List[Dict[str, str]]:
     """Guarantee one *clean, single-major* majors_retriever step per major.
 
-    Why this exists: runtime logs (debug session 97c192) showed the planner
+    Why this exists: runtime investigation showed the planner
     emitting compound multi-major queries like
     ``"Computer Science B.S. ... and Psychology B.A./B.S. ..."`` as its
     first majors_retriever step. Chroma's vector search returned a single
@@ -1500,87 +1640,102 @@ def build_orchestration_plan(
     available_tools_list = ", ".join(dict.fromkeys(str(tool) for tool in available_tools))
     time_context = _current_datetime_context()
     system_prompt = (
-        "You are the orchestrator for an academic advising assistant. "
-        "Return ONLY valid JSON with these exact keys: "
-        "normalized_question, corrected_question, resolved_user_need, domain, deliverable, "
-        "plan_scope, semester_horizon, use_tools, allowed_tools, executor_path, must_not_do, "
-        "success_criteria, retrieval_plan, synthesis_brief, majors.\n\n"
-        "MAJORS EXTRACTION (you MUST do this):\n"
-        "Whenever the question references one or more academic majors, populate the `majors` "
-        "field with a clean list of every major name you can identify. Examples:\n"
-        "  - \"computer science\"                       -> [\"Computer Science\"]\n"
-        "  - \"art and accounting double major\"        -> [\"Art\", \"Accounting\"]\n"
-        "  - \"psych / bio dual\"                       -> [\"Psychology\", \"Biology\"]\n"
-        "  - \"undecided\" / \"any major\" / no major    -> []\n"
-        "When `majors` has more than one entry, the executor will fan retrieval out per major and "
-        "the synthesizer will be told to cover requirements from EACH major. Your retrieval_plan "
-        "for a multi-major question SHOULD also include per-major retrievals (one majors_retriever "
-        "step per major name) so each catalog actually gets hit.\n\n"
-        "TOOL SELECTION RULES (you MUST follow these):\n"
-        "1. Any question about specific Penn State courses, majors/degree requirements, academic "
-        "policies/deadlines, or the student's transcript MUST set use_tools=true and include the "
-        "appropriate retrievers in allowed_tools. These are grounded-knowledge domains: "
-        "course, major, policy, transcript. Do NOT answer them from memory.\n"
-        "2. For grounded domains, set executor_path to match the domain:\n"
-        "   - major     -> major_lookup        (tools: majors_retriever, course_retriever, prerequisite_graph, web_search)\n"
-        "   - course    -> course_lookup       (tools: course_retriever, prerequisite_graph, web_search)\n"
-        "   - policy    -> policy_lookup       (tools: policy_retriever, web_search)\n"
-        "   - transcript-> deterministic_plan  (tools: transcript_state, deterministic_planner, conversation_history)\n"
-        "             or transcript_audit       when the deliverable is an audit.\n"
-        "3. use_tools=false is ONLY appropriate for:\n"
-        "   - profile recall (\"what's my major\", \"what year am I\") -> conversation_profile_recall\n"
-        "   - narrowing a previously given plan                      -> conversation_plan_slice\n"
-        "   - pure conversational threading where no Penn State-specific fact is claimed.\n"
-        "4. For unexpected factual questions that need fresh/sourced information (not stored in our "
-        "retrievers), use executor_path=research_lookup with web_search.\n"
-        "5. NEVER return specific course codes, course titles, deadlines, or policy text in a downstream "
-        "response unless you enabled a retriever for it. If uncertain, include web_search in allowed_tools "
-        "as a safety net.\n\n"
-        "RETRIEVAL PLAN (you MUST think in terms of 'what do I need to retrieve and why'):\n"
-        "Data retrieval is itself a tool. The executor will not pick tools on its own — it executes the "
-        "exact retrieval_plan you produce. Each step is an object with three keys:\n"
-        "  - tool   : name from allowed_tools (e.g. \"majors_retriever\", \"course_retriever\", \"prerequisite_graph\", \"policy_retriever\", \"web_search\").\n"
-        "  - query  : the natural-language query you want that tool to run.\n"
-        "  - reason : one short sentence explaining why this retrieval is needed before synthesis.\n"
-        "Order matters: list earlier the retrievals whose results inform later ones.\n"
-        "MANDATORY: when the deliverable involves recommending or scheduling courses for the student "
-        "(single_semester_plan, multi_semester_plan, full_graduation_plan, or any major_lookup that asks "
-        "for specific courses), retrieval_plan MUST include a prerequisite_graph step covering every "
-        "candidate course. Without prereq edges in the bundle, the executor cannot avoid scheduling "
-        "violations like placing CMPSC 132 in the same semester as its prereq CMPSC 131.\n\n"
-        "MANDATORY: when the deliverable involves recommending courses, your course_retriever queries "
-        "MUST cover not only the prescribed/required courses but also concrete examples for every gen-ed "
-        "or elective bucket the major contains (humanities/GH, social science/GS, natural science/GN, "
-        "arts/GA, quantification/GQ, health and wellness/GHW, writing-speaking/GWS, US/IL cultures, "
-        "foreign language, option/track electives, free electives). Issue separate course_retriever steps "
-        "(one per bucket if needed) so the executor's bundle contains specific course codes for every "
-        "category the synthesizer might need to fill — otherwise the synthesizer is forced to write bare "
-        "'Elective' / 'Gen Ed' lines that the validator will reject.\n\n"
-        "synthesis_brief is one short paragraph telling the executor's synthesizer what to do with the "
-        "retrieved bundle (e.g. \"Build a 15-credit Semester 1 block for Computer Science using only "
-        "courses present in majors_retriever and course_retriever; never schedule a course unless its "
-        "enrollment prerequisites from prerequisite_graph are absent or already satisfied in earlier "
-        "semesters of this response.\").\n\n"
-        "Worked example (course recommendation, single semester):\n"
+        "You are the ORCHESTRATOR for a Penn State Abington academic advising assistant. "
+        "You do not answer the student. You convert the student's request into a safe execution plan.\n\n"
+        + PRIVATE_REASONING_GUIDANCE
+        + "\n\nOutput contract:\n"
+        "- Return ONLY valid JSON. No markdown, prose, comments, code fences, or explanations.\n"
+        "- Use exactly these top-level keys: normalized_question, corrected_question, resolved_user_need, "
+        "domain, deliverable, plan_scope, semester_horizon, use_tools, allowed_tools, executor_path, "
+        "must_not_do, success_criteria, retrieval_plan, synthesis_brief, majors.\n"
+        "- If uncertain, choose the safer grounded route and explain the uncertainty in success_criteria or "
+        "synthesis_brief, not outside JSON.\n\n"
+        "Private planning checklist (do not reveal):\n"
+        "1. Restate the student's intent and fix obvious typos without changing meaning.\n"
+        "2. Decide whether the answer needs grounded Penn State data, transcript state, current web evidence, "
+        "or only conversation history.\n"
+        "3. Choose one domain, one deliverable, one plan_scope, and one executor_path.\n"
+        "4. Build the retrieval_plan in the order the executor should run tools.\n"
+        "5. Add hard limits in must_not_do and a concrete success_criteria string.\n\n"
+        "Enums and examples:\n"
+        "- domain: transcript, course, major, policy, general_academic_chat.\n"
+        "  Example: 'what are CMPSC 132 prereqs?' -> course.\n"
+        "  Example: 'give me a computer science plan' -> major.\n"
+        "  Example: 'audit my transcript' -> transcript.\n"
+        "  Example: 'late drop deadline' -> policy.\n"
+        "- deliverable: direct_answer, audit, single_semester_plan, multi_semester_plan, "
+        "full_graduation_plan, course_lookup, major_lookup, policy_lookup.\n"
+        "  Example: 'next semester only' -> single_semester_plan.\n"
+        "  Example: 'full graduation plan' -> full_graduation_plan.\n"
+        "- plan_scope: single_semester, multi_semester, full_graduation, audit, direct_answer.\n"
+        "  Example: 'next two semesters' -> multi_semester with semester_horizon 2.\n"
+        "  Example: 'what is ENGL 15?' -> direct_answer with semester_horizon 0.\n\n"
+        "Major extraction rule:\n"
+        "- Whenever the question references one or more majors, populate majors with every clean major name "
+        "you can identify.\n"
+        "  Example: 'computer science' -> [\"Computer Science\"].\n"
+        "  Example: 'art and accounting double major' -> [\"Art\", \"Accounting\"].\n"
+        "  Example: 'psych / bio dual' -> [\"Psychology\", \"Biology\"].\n"
+        "  Example: 'undecided', 'any major', or no major -> [].\n"
+        "- For multiple majors, include one majors_retriever retrieval step per major so the executor can "
+        "cover EACH major instead of blending requirements.\n\n"
+        "Tool selection rules:\n"
+        "1. Questions about specific Penn State courses, majors/degree requirements, academic "
+        "policies/deadlines, or the student's transcript MUST set use_tools=true. Never answer these from "
+        "memory.\n"
+        "2. Match grounded domains to executor paths:\n"
+        "   - major -> major_lookup. Example tools: majors_retriever, course_retriever, prerequisite_graph, web_search.\n"
+        "   - course -> course_lookup. Example tools: prerequisite_graph, course_retriever, web_search.\n"
+        "   - policy -> policy_lookup. Example tools: policy_retriever, web_search.\n"
+        "   - transcript -> deterministic_plan. Example tools: transcript_state, deterministic_planner, conversation_history.\n"
+        "   - transcript audit -> transcript_audit. Example tools: transcript_state, transcript_retriever.\n"
+        "3. use_tools=false is only for profile recall, narrowing a plan already in conversation, or pure "
+        "conversation with no Penn State-specific claims.\n"
+        "   Example: 'what year am I?' after the student said 'I am a junior' -> conversation_profile_recall.\n"
+        "   Example: 'show just next semester from that plan' -> conversation_plan_slice.\n"
+        "4. Unexpected factual questions needing sourced/current data should use research_lookup with "
+        "web_search. Example: 'when was Python 3.12 released?' -> research_lookup, not course_lookup.\n"
+        "5. If a downstream answer could contain course codes, course titles, deadlines, or policy text, "
+        "enable the corresponding retriever or web_search.\n\n"
+        "Retrieval plan rules:\n"
+        "- retrieval_plan is an ordered array of objects. Each object has tool, query, and reason.\n"
+        "- tool must be from allowed_tools. Example: \"course_retriever\".\n"
+        "- query is the exact query the executor should run. Example: \"CMPSC 131 CMPSC 132 MATH 140 titles credits\".\n"
+        "- reason is one short sentence. Example: \"Get titles, credits, and descriptions for candidate courses.\".\n"
+        "- For any course recommendation or schedule, retrieval_plan MUST include prerequisite_graph covering "
+        "every candidate course. Example reason: \"Get enforced and concurrent prerequisites so the plan does "
+        "not schedule CMPSC 132 before CMPSC 131.\".\n"
+        "- For major plans, course_retriever queries MUST also cover concrete examples for every gen-ed or "
+        "elective bucket: GH, GA, GS, GN, GQ, GHW, GWS, US, IL, foreign language, option/track electives, "
+        "and free electives. Example query: \"GH humanities gen ed examples ART 001 HIST 148 ENGL 202D\".\n\n"
+        "synthesis_brief rule:\n"
+        "- Write one short paragraph telling the executor exactly what to produce from the retrieved data.\n"
+        "- Include scope and safety constraints.\n"
+        "  Example: \"Build exactly one 15-17 credit Semester 1 block for Computer Science using only retrieved "
+        "course codes and titles. Do not schedule any course whose enforced prerequisite is not absent or "
+        "already satisfied earlier in this response. Show inline prerequisites for each recommended course.\"\n\n"
+        "Worked JSON example (single-semester course recommendation):\n"
         "{\n"
+        "  \"normalized_question\": \"first semester computer science plan\",\n"
+        "  \"corrected_question\": \"First-semester Computer Science plan\",\n"
+        "  \"resolved_user_need\": \"Build a grounded first-semester Computer Science schedule.\",\n"
         "  \"domain\": \"major\",\n"
         "  \"deliverable\": \"single_semester_plan\",\n"
-        "  \"executor_path\": \"major_lookup\",\n"
+        "  \"plan_scope\": \"single_semester\",\n"
+        "  \"semester_horizon\": 1,\n"
+        "  \"use_tools\": true,\n"
         "  \"allowed_tools\": [\"majors_retriever\", \"course_retriever\", \"prerequisite_graph\"],\n"
+        "  \"executor_path\": \"major_lookup\",\n"
+        "  \"must_not_do\": [\"Do not invent courses\", \"Do not omit prerequisites\"],\n"
+        "  \"success_criteria\": \"Return exactly one Semester 1 block with course titles, inline prerequisites, and total credits.\",\n"
         "  \"retrieval_plan\": [\n"
-        "    {\"tool\": \"majors_retriever\", \"query\": \"Computer Science B.S. Abington prescribed and option courses\", \"reason\": \"Get the official major requirements and the prescribed sequence.\"},\n"
-        "    {\"tool\": \"course_retriever\", \"query\": \"CMPSC 131 CMPSC 132 MATH 140 ENGL 15 first semester courses\", \"reason\": \"Get titles, credit values, and descriptions for candidate first-semester courses.\"},\n"
-        "    {\"tool\": \"prerequisite_graph\", \"query\": \"CMPSC 131,CMPSC 132,MATH 140,MATH 141,PHYS 211,ENGL 15,CAS 100A\", \"reason\": \"Get enrollment and concurrent prereqs so the synthesis avoids scheduling violations.\"}\n"
+        "    {\"tool\": \"majors_retriever\", \"query\": \"Computer Science B.S. Abington prescribed courses first semester\", \"reason\": \"Get official major requirements and sequence.\"},\n"
+        "    {\"tool\": \"course_retriever\", \"query\": \"CMPSC 131 MATH 140 ENGL 15 PSU 1 first semester titles credits\", \"reason\": \"Get titles and credits for candidate courses.\"},\n"
+        "    {\"tool\": \"prerequisite_graph\", \"query\": \"CMPSC 131,MATH 140,ENGL 15,PSU 1\", \"reason\": \"Verify enforced and concurrent prerequisites for each candidate.\"}\n"
         "  ],\n"
-        "  \"synthesis_brief\": \"Build a 15-credit Semester 1 schedule for Computer Science. Only schedule a course whose enrollment prerequisites in prerequisite_graph are absent (this is semester 1, so no prereqs can be satisfied yet). Use exact course codes and titles from the retrieved bundle.\"\n"
-        "}\n\n"
-        "If the deliverable is direct_answer with no retrieval needed (e.g. profile recall, plan slice), "
-        "return retrieval_plan as an empty list and synthesis_brief as a one-line directive.\n\n"
-        "Enum values:\n"
-        "- plan_scope: single_semester, multi_semester, full_graduation, audit, direct_answer.\n"
-        "- domain: transcript, course, major, policy, general_academic_chat.\n"
-        "- deliverable: direct_answer, audit, single_semester_plan, multi_semester_plan, "
-        "full_graduation_plan, course_lookup, major_lookup, policy_lookup."
+        "  \"synthesis_brief\": \"Build exactly one first-semester block using only retrieved courses. Include PSU 1 when present. Show '(prerequisites: ...)' on every course line.\",\n"
+        "  \"majors\": [\"Computer Science\"]\n"
+        "}"
     )
     user_prompt = (
         f"{time_context}\n"
@@ -1878,16 +2033,11 @@ def _validate_multi_major_coverage(
 ) -> Optional[str]:
     """Whether the response actually covers every major the planner identified.
 
-    For a question like "art and accounting double major", ``plan.majors``
-    will be ``["Art", "Accounting"]``. The shipped response MUST mention
-    each of those names somewhere (case-insensitive). If any major is
-    missing, we surface a ``missing_major_coverage`` retry reason so the
-    synthesizer re-runs with the omission flagged.
-
-    The check is purely structural: it does not try to decide whether the
-    *coverage* is good (that's the synthesizer's job), only whether each
-    major was named at all. A response that omits one of the requested
-    majors is by definition incomplete for the deliverable.
+    For a question like "biology and computer science double major",
+    ``plan.majors`` will contain both majors. The shipped response must do
+    more than mention both names in prose: semester course lines need explicit
+    major labels so a single-major plan cannot pass as a double-major plan by
+    adding a generic note at the end.
     """
     text = (response_text or "").lower()
     if not text:
@@ -1897,24 +2047,84 @@ def _validate_multi_major_coverage(
         })
         # #endregion
         return None
-    missing = [m for m in (majors or []) if m and m.strip() and m.strip().lower() not in text]
+    clean_majors = [m for m in (majors or []) if m and m.strip()]
+    missing = [m for m in clean_majors if m.strip().lower() not in text]
     # #region debug log (H-A3: substring coverage check)
     _dbg("H-A3", "orchestration_pipeline.py:_validate_multi_major_coverage", "checked", {
-        "plan_majors": list(majors or []),
+        "plan_majors": clean_majors,
         "missing": missing,
         "response_len": len(text),
     })
     # #endregion
-    if not missing:
+    if missing:
+        requested = ", ".join(m for m in clean_majors if m)
+        missing_str = ", ".join(missing)
+        return (
+            f"The student asked about {len(clean_majors)} majors ({requested}), but the "
+            f"response does not mention {missing_str}. A double/multi-major plan must "
+            "cover required courses from EACH major and label which courses come from "
+            "which. Re-do the answer including the missing major(s)."
+        )
+
+    semester_blocks = _extract_semester_blocks(response_text)
+    if not semester_blocks:
         return None
-    requested = ", ".join(m for m in majors if m)
-    missing_str = ", ".join(missing)
-    return (
-        f"The student asked about {len(list(majors))} majors ({requested}), but the "
-        f"response does not mention {missing_str}. A double/multi-major plan must "
-        "cover required courses from EACH major and label which courses come from "
-        "which. Re-do the answer including the missing major(s)."
-    )
+
+    def major_terms(major: str) -> List[str]:
+        tokens = [
+            t.lower()
+            for t in re.split(r"[^A-Za-z]+", major or "")
+            if len(t) > 2 and t.lower() not in {"major", "degree", "program", "abington", "penn", "state"}
+        ]
+        return tokens or [major.strip().lower()]
+
+    major_token_map = {major: major_terms(major) for major in clean_majors}
+
+    def label_matches_major(label: str, major: str) -> bool:
+        label_lower = label.lower()
+        terms = major_token_map.get(major, [])
+        return bool(terms) and all(term in label_lower for term in terms)
+
+    labeled_major_hits = {major: 0 for major in clean_majors}
+    unlabeled_course_lines: List[str] = []
+    for block in semester_blocks:
+        for raw_line in block.splitlines():
+            line = raw_line.strip()
+            if not COURSE_CODE_RE.search(line):
+                continue
+            labels = re.findall(r"\[([^\]]+)\]", line)
+            if not labels:
+                unlabeled_course_lines.append(line)
+                continue
+            if any("shared" in label.lower() or "double" in label.lower() for label in labels):
+                continue
+            matched_any = False
+            for major in clean_majors:
+                if any(label_matches_major(label, major) for label in labels):
+                    labeled_major_hits[major] += 1
+                    matched_any = True
+            if not matched_any:
+                unlabeled_course_lines.append(line)
+
+    if unlabeled_course_lines:
+        sample = "; ".join(unlabeled_course_lines[:3])
+        return (
+            "The response has semester course lines without a major label. In a double/multi-major "
+            "plan, each course line must be tagged with the major it serves, e.g. '[Biology]', "
+            "'[Computer Science]', or '[Shared/double-counts]'. Unlabeled examples: "
+            f"{sample}"
+        )
+
+    missing_labeled_major = [major for major, count in labeled_major_hits.items() if count == 0]
+    if missing_labeled_major:
+        missing_str = ", ".join(missing_labeled_major)
+        return (
+            "The response names all requested majors, but the semester plan does not label any course "
+            f"line for {missing_str}. A double/multi-major plan must include labeled courses from each "
+            "requested major or mark shared courses explicitly."
+        )
+
+    return None
 
 
 def _validate_prerequisite_satisfaction(
@@ -2155,36 +2365,51 @@ def run_finalizer_stage(
 
     system_prompt = (
         ADVISOR_PERSONA
-        + "\n\nYou are the final response layer. Rewrite the draft so it follows the persona contract "
-        "above WITHOUT changing the answer scope or inventing new facts.\n\n"
-        "Required response shape:\n"
-        "1. A warm, encouraging answer to what the student asked, drawn entirely from the draft and the "
-        "supporting context.\n"
-        "2. A 'Things to consider next:' section with 3-5 short bullets covering related details the "
-        "student would benefit from (prereqs, gen-ed tags, registration windows, related courses, advising "
-        "office). Skip this section ONLY if there is genuinely nothing grounded to add (rare).\n"
-        "3. A closing line: if a critical piece of info would meaningfully change the answer, end with ONE "
-        "specific clarifying question; otherwise end with a brief forward-looking nudge. Skip the question "
-        "if the same one was clearly asked in the recent conversation.\n\n"
+        + "\n\nYou are the FINAL RESPONSE LAYER. Your job is to turn the executor draft into the exact "
+        "message the student sees. Improve clarity, formatting, and helpfulness WITHOUT changing scope or "
+        "adding facts.\n\n"
+        + PRIVATE_REASONING_GUIDANCE
+        + "\n\nPrivate editing checklist (do not reveal):\n"
+        "1. Identify the student's exact ask and the executor's answer scope.\n"
+        "2. Preserve any semester blocks exactly as standalone Markdown blocks.\n"
+        "3. Remove internal terms and confusing placeholders.\n"
+        "4. Add only grounded helpful next-step bullets.\n"
+        "5. Decide whether one specific clarifying question is needed.\n\n"
+        "Required response shape inside final_response:\n"
+        "1. Direct answer first, in a warm and encouraging advisor voice.\n"
+        "   Example: 'Here is a standard Computer Science plan based on the available Abington data.'\n"
+        "2. If the draft contains a semester plan, keep each semester block readable:\n"
+        "   Example shape:\n"
+        "   Semester 1:\n"
+        "   CMPSC 131: Programming and Computation I (prerequisites: None)\n"
+        "   MATH 140: Calculus I (prerequisites: None)\n"
+        "   Total Credits: 15\n"
+        "3. Add 'Things to consider next:' with 3-5 short bullets when grounded details are available.\n"
+        "   Example bullets: '- Confirm placement requirements before registering for MATH 140.' "
+        "'- Meet with your advisor if a gen-ed bucket needs approval.'\n"
+        "4. Closing line: ask ONE specific clarifying question only when missing information would materially "
+        "change the answer; otherwise use a short forward-looking nudge.\n"
+        "   Example clarifying question: 'What semester are you planning for next?'\n\n"
         "Hard rules (do NOT violate):\n"
-        "- Quote any 'Semester N: ... Total Credits: N' block in the draft VERBATIM. Do not wrap it in "
-        "prose, do not split it, do not change the labels. Downstream parsing depends on this exact shape.\n"
-        "- Do not introduce course codes, deadlines, or policy text that aren't in the draft or recent "
-        "context.\n"
-        "- Do not change the answer's scope (e.g., do not add semesters not in the draft).\n"
-        "- INLINE PREREQUISITE RULE (semester blocks only): every Penn State course code that appears "
-        "inside a 'Semester N:' block MUST be immediately followed by '(prerequisites: <list>)' or "
-        "'(prerequisites: None)'. Pull the list from the draft. "
-        "Outside of semester blocks (prose, 'Things to consider next', closing questions, asides), "
-        "prerequisite annotations are optional: include them only when the prereq list is already known "
-        "from the draft. If you do NOT know the prereqs for a course being mentioned in prose, simply "
-        "use the bare course code — do NOT write '(prerequisites: not retrieved)' or any similar "
-        "placeholder; these confuse students and pollute the reading flow.\n"
+        "- Keep any 'Semester N:' block VERBATIM as a standalone Markdown block. Do not put quotation marks "
+        "around it, do not collapse it into one paragraph, and do not wrap it in prose. Each course/slot "
+        "must stay on its own line and 'Total Credits: N' must stay on its own line.\n"
+        "- Do not introduce course codes, deadlines, policies, offices, or degree requirements that are not "
+        "in the draft or recent context.\n"
+        "- Do not change answer scope. Example: if the draft has one semester, do not add semesters 2-8.\n"
+        "- INLINE PREREQUISITE RULE (semester blocks): every Penn State course code inside a 'Semester N:' "
+        "block MUST be immediately followed by '(prerequisites: <list>)' or '(prerequisites: None)'. Pull "
+        "the list from the draft.\n"
+        "- Prose prerequisite rule: outside semester blocks, prerequisite annotations are optional. Include "
+        "them only when known from the draft. If unknown, use the bare course code and advise confirmation; "
+        "do NOT write '(prerequisites: not retrieved)' or similar placeholders.\n"
         "Examples:\n"
         "    (semester block) 'CMPSC 132 (prerequisites: CMPSC 131)'\n"
-        "    (prose, known)   'Take CMPSC 132 (prerequisites: CMPSC 131) after finishing CMPSC 131.'\n"
-        "    (prose, unknown) 'CMPSC 312 appears often as a prerequisite, so confirm it is completed.'\n\n"
-        "Return ONLY valid JSON with keys: final_response, finalizer_notes."
+        "    (prose, known)   'Take CMPSC 132 (prerequisites: CMPSC 131) after CMPSC 131.'\n"
+        "    (prose, unknown) 'CMPSC 312 appears in the plan, so confirm its prerequisites before enrolling.'\n\n"
+        "Return ONLY valid JSON with keys: final_response, finalizer_notes.\n"
+        "Example JSON:\n"
+        "{\"final_response\":\"Great question. Here is the grounded answer...\",\"finalizer_notes\":\"preserved scope; added grounded next steps\"}"
     )
     user_prompt = (
         f"{_current_datetime_context()}\n"
@@ -2206,9 +2431,10 @@ def run_finalizer_stage(
     if parsed:
         final_response = str(parsed.get("final_response", "") or "").strip()
     if not final_response:
-        final_response = _append_follow_up_invitation(draft)
-    else:
-        final_response = _append_follow_up_invitation(final_response)
+        final_response = draft
+    final_response = canonicalize_semester_blocks(final_response)
+    final_response = _append_follow_up_invitation(final_response)
+    final_response = canonicalize_semester_blocks(final_response)
 
     # Re-verify any '(prerequisites: ...)' annotation the FINALIZER added
     # (e.g. in 'Things to consider next' bullets or follow-up prose).
@@ -2222,6 +2448,8 @@ def run_finalizer_stage(
                 final_response = rewrite_inline_prereqs(final_response, prereq_graph_text)
             except Exception as exc:  # pragma: no cover - defensive
                 print(f"⚠️ finalizer-stage prereq rewrite failed: {exc}")
+
+    final_response = sanitize_public_response(final_response)
 
     validation = validate_final_response(
         plan=plan,

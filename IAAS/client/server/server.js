@@ -2,12 +2,26 @@ const express = require('express');
 const mysql = require('mysql2');
 const bcrypt = require('bcrypt');
 const { exec } = require('child_process');
+const jwt = require('jsonwebtoken');
 const saltRounds = 10;
 const cors = require('cors');
 
 const app = express();
 app.use(express.json());
-app.use(cors());
+
+const configuredCorsOrigins = String(process.env.AUTH_CORS_ORIGINS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+const allowedCorsOrigins = configuredCorsOrigins.length > 0
+    ? configuredCorsOrigins
+    : ['http://localhost:3000', 'http://127.0.0.1:3000'];
+app.use(cors({ origin: allowedCorsOrigins }));
+
+const jwtSecret = process.env.JWT_SECRET || 'iaas-local-development-secret';
+if (!process.env.JWT_SECRET) {
+    console.warn('⚠️ JWT_SECRET not set. Using local development secret; set JWT_SECRET for production.');
+}
 
 const dbConfig = {
     host: process.env.MYSQL_HOST || '127.0.0.1',
@@ -51,8 +65,8 @@ if (disableDb) {
     const connectDb = () => {
         connection = mysql.createConnection(dbConfig);
 
-connection.connect((err) => {
-    if (err) {
+        connection.connect((err) => {
+            if (err) {
                 dbAvailable = false;
                 const isConnRefused = err.code === 'ECONNREFUSED';
                 if (isConnRefused) {
@@ -72,11 +86,11 @@ connection.connect((err) => {
                 if (err.address || err.port) {
                     console.warn(`   ${err.address || ''}:${err.port || ''}`);
                 }
-        return;
-    }
+                return;
+            }
             dbAvailable = true;
-    console.log('Connected to database');
-});
+            console.log('Connected to database');
+        });
 
         connection.on('error', (err) => {
             dbAvailable = false;
@@ -97,7 +111,39 @@ const ensureDbAvailable = (req, res, next) => {
     return next();
 };
 
-app.post('/api/register', ensureDbAvailable, async (req, res) => {
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!token) {
+        return res.status(401).json({ error: 'Missing authorization token' });
+    }
+    try {
+        req.user = jwt.verify(token, jwtSecret);
+        return next();
+    } catch (err) {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+};
+
+const requireRole = (roles) => (req, res, next) => {
+    if (!roles.includes(req.user?.role)) {
+        return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    return next();
+};
+
+app.get('/api/health', (req, res) => {
+    res.json({
+        ok: true,
+        database: disableDb ? 'disabled' : (dbAvailable ? 'connected' : 'unavailable')
+    });
+});
+
+app.get('/api/me', authenticateToken, (req, res) => {
+    res.json({ user: req.user });
+});
+
+app.post('/api/register', authenticateToken, requireRole(['admin']), ensureDbAvailable, async (req, res) => {
     const { name, email, password, role, sex, dateOfBirth } = req.body;
     console.log("Role from client:", role);
 
@@ -159,7 +205,20 @@ app.post('/api/login', ensureDbAvailable, async (req, res) => {
         }
 
         if (passwordMatch) {
-            res.json({ message: 'Login successful', token: 'dummy-token-' + user.id, user: { id: user.id, name: user.name, email: user.email, role: user.role, sex: user.sex, dateOfBirth: user.dateOfBirth } }); // Send user data
+            const safeUser = {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role,
+                sex: user.sex,
+                dateOfBirth: user.dateOfBirth
+            };
+            const token = jwt.sign(
+                { sub: String(user.id), email: user.email, role: user.role, name: user.name },
+                jwtSecret,
+                { expiresIn: process.env.JWT_EXPIRES_IN || '8h' }
+            );
+            res.json({ message: 'Login successful', token, user: safeUser });
         } else {
             res.status(401).json({ error: 'Invalid credentials' });
         }

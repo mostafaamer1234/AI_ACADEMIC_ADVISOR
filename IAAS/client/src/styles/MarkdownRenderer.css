@@ -95,6 +95,11 @@
     font-weight: 400;
     font-style: normal;
 }
+.mdx-prereq {
+    display: inline-block;
+    margin-left: 6px;
+    opacity: 0.86;
+}
 
 /* ----- Semester block ------------------------------------------------------ */
 

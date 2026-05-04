@@ -28,6 +28,9 @@ env/
 flask.log
 flask_server.log
 
+# Local runtime state
+.runtime/
+
 # Chroma vector DB (local data)
 chroma_data/
 

@@ -9,6 +9,7 @@ Fixes:
 
 from __future__ import annotations
 
+import ast
 import io
 import math
 import os
@@ -25,7 +26,7 @@ import pandas as pd
 import networkx as nx
 
 
-COURSE_TOKEN_RE = re.compile(r"\b([A-Z]{2,8}(?:/[A-Z]{2,8})*)\s*(\d{3}[A-Z]?)\b")
+COURSE_TOKEN_RE = re.compile(r"\b([A-Z]{2,8}(?:/[A-Z]{2,8})*)\s*(\d{1,3}[A-Z]?)\b")
 GENED_CREDITS_RE = re.compile(r"([A-Za-z \-\(\)]+):\s*(\d+)\s*credits", re.IGNORECASE)
 
 GENED_CATEGORY_LABELS = {
@@ -59,6 +60,10 @@ def format_planned_course_label(course: str) -> str:
             if pieces and all(re.fullmatch(r"G[A-Z]{1,3}", p) for p in pieces):
                 desc = "/".join(GENED_CATEGORY_LABELS.get(p, p) for p in pieces)
                 return f"Gen Ed ({'/'.join(pieces)} - {desc})"
+            gened_codes = [p for p in pieces if p in GENED_CATEGORY_LABELS]
+            if gened_codes:
+                code = gened_codes[-1]
+                return f"Gen Ed ({code} - {GENED_CATEGORY_LABELS[code]})"
 
         if re.fullmatch(r"G[A-Z]{1,3}", normalized_key):
             return f"Gen Ed ({normalized_key})"
@@ -79,12 +84,12 @@ def _course_level(c: str) -> int:
 
     Handles both plain codes (``CMPSC 132``) and codes with letter suffixes used
     by Penn State to tag writing/honors/etc. (``CMPSC 487W``, ``ENGL 202C``,
-    ``DS 440W``). A strict ``\\b(\\d{3})\\b`` boundary would fail on the
+    ``DS 440W``). A strict ``\\b(\\d{1,3})\\b`` boundary would fail on the
     suffixed form because ``\\d\\b`` requires a non-word char after the digits,
     and a letter is still a word char — so ``487W`` never matched and the
     function used to return 9999 for every W/C/H/M-suffixed course.
     """
-    m = re.search(r"(?<![A-Z0-9])(\d{3})(?=[A-Z]?\b|\s|$)", c)
+    m = re.search(r"(?<![A-Z0-9])(\d{1,3})(?=[A-Z]?\b|\s|$)", c)
     return int(m.group(1)) if m else 9999
 
 
@@ -133,6 +138,46 @@ def _parse_credits(value, default: int = 0) -> int:
     return max(nums) if nums else default
 
 
+def _parse_course_credit_value(value, default: int = 3) -> int:
+    text = str(value or "")
+    credit_match = re.search(r"(\d+(?:\s*[-–]\s*\d+)?)\s+Credits?", text, re.IGNORECASE)
+    if credit_match:
+        return _parse_credits(credit_match.group(1), default=default)
+    return default
+
+
+def _clean_course_title(value: str) -> str:
+    title = str(value or "").replace("\n", " ").replace("\t", " ")
+    title = re.sub(r"\s+", " ", title).strip()
+    title = re.sub(r"\s+\d+(?:\s*[-–]\s*\d+)?\s+Credits?.*$", "", title, flags=re.IGNORECASE)
+    return title.strip()
+
+
+def _build_course_metadata(courses_csv_path: str) -> Tuple[Dict[str, str], Dict[str, int]]:
+    titles: Dict[str, str] = {}
+    credits: Dict[str, int] = {}
+    try:
+        df = pd.read_csv(courses_csv_path)
+    except Exception:
+        return titles, credits
+    for _, row in df.iterrows():
+        code = _normalize_course_code(str(row.get("course_number", "") or ""))
+        if not code:
+            continue
+        title = _clean_course_title(row.get("course_name", ""))
+        if title:
+            titles[code] = title
+        credits[code] = _parse_course_credit_value(row.get("course_name", ""), default=3)
+    return titles, credits
+
+
+def _first_year_seminar_code(course_titles: Dict[str, str]) -> Optional[str]:
+    for code in ("PSU 1", "PSU 101"):
+        if code in course_titles:
+            return code
+    return None
+
+
 def load_prereq_map(courses_csv_path: str) -> Dict[str, List[str]]:
     df = pd.read_csv(courses_csv_path)
     prereq_map: Dict[str, List[str]] = {}
@@ -143,7 +188,7 @@ def load_prereq_map(courses_csv_path: str) -> Dict[str, List[str]]:
     for _, row in df.iterrows():
         course = str(row.get("course_number", "")).strip()
         # Extract base course code (e.g., "MATH 311" from "MATH 311M")
-        base_match = re.match(r'([A-Z]{2,})\s+(\d{3})', course)
+        base_match = re.match(r'([A-Z]{2,})\s+(\d{1,3})', course)
         if base_match:
             base_code = f"{base_match.group(1)} {base_match.group(2)}"
             if base_code not in base_to_actual:
@@ -161,7 +206,7 @@ def load_prereq_map(courses_csv_path: str) -> Dict[str, List[str]]:
         raw_direct = row.get("prerequisite_data", None)
         if isinstance(raw_direct, str) and raw_direct.strip():
             try:
-                raw_list = eval(raw_direct)
+                raw_list = ast.literal_eval(raw_direct)
                 if isinstance(raw_list, (list, tuple)):
                     raw_text = " ".join(str(x) for x in raw_list)
                 else:
@@ -176,7 +221,9 @@ def load_prereq_map(courses_csv_path: str) -> Dict[str, List[str]]:
             raw = row.get("prerequisite_course_numbers", None)
             if isinstance(raw, str) and raw.strip():
                 try:
-                    prereqs = [x.strip() for x in eval(raw)]
+                    parsed = ast.literal_eval(raw)
+                    if isinstance(parsed, (list, tuple)):
+                        prereqs = [str(x).strip() for x in parsed]
                 except Exception:
                     pass
         
@@ -195,7 +242,7 @@ def load_prereq_map(courses_csv_path: str) -> Dict[str, List[str]]:
         prereq_map[course] = prereqs
         
         # Also add base code entries for matching (e.g., "MATH 311" for "MATH 311M")
-        base_match = re.match(r'([A-Z]{2,})\s+(\d{3})', course)
+        base_match = re.match(r'([A-Z]{2,})\s+(\d{1,3})', course)
         if base_match:
             base_code = f"{base_match.group(1)} {base_match.group(2)}"
             # If base code doesn't exist, create it with the same prerequisites
@@ -253,11 +300,11 @@ def add_all_prerequisites_to_plan(
             
             # Also try base code matching
             if not prereqs:
-                base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", c_norm)
+                base_match = re.match(r"([A-Z]{2,})\s+(\d{1,3})", c_norm)
                 if base_match:
                     base_code = f"{base_match.group(1)} {base_match.group(2)}"
                     for orig_course in prereq_map.keys():
-                        orig_base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", orig_course)
+                        orig_base_match = re.match(r"([A-Z]{2,})\s+(\d{1,3})", orig_course)
                         if orig_base_match and f"{orig_base_match.group(1)} {orig_base_match.group(2)}" == base_code:
                             prereqs.extend(prereq_map.get(orig_course, []))
             
@@ -266,12 +313,12 @@ def add_all_prerequisites_to_plan(
                 prereq_norm = _normalize_course_code(prereq)
                 if prereq_norm not in planned_set:
                     # Check if we already have a base code match
-                    base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", prereq_norm)
+                    base_match = re.match(r"([A-Z]{2,})\s+(\d{1,3})", prereq_norm)
                     already_has_base = False
                     if base_match:
                         prereq_base = f"{base_match.group(1)} {base_match.group(2)}"
                         for existing_course in planned_set:
-                            existing_base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", existing_course)
+                            existing_base_match = re.match(r"([A-Z]{2,})\s+(\d{1,3})", existing_course)
                             if existing_base_match:
                                 existing_base = f"{existing_base_match.group(1)} {existing_base_match.group(2)}"
                                 if prereq_base == existing_base:
@@ -423,7 +470,7 @@ def schedule_mixed_by_prereqs(
                 continue
             c_norm = _normalize_course_code(c)
             completed_set.add(c_norm)
-            base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", c_norm)
+            base_match = re.match(r"([A-Z]{2,})\s+(\d{1,3})", c_norm)
             if base_match:
                 completed_base_set.add(
                     f"{base_match.group(1)} {base_match.group(2)}"
@@ -446,7 +493,7 @@ def schedule_mixed_by_prereqs(
     # Also create base code -> list of courses mapping for matching
     base_to_courses: Dict[str, List[str]] = {}
     for orig_course in prereq_map.keys():
-        base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", orig_course)
+        base_match = re.match(r"([A-Z]{2,})\s+(\d{1,3})", orig_course)
         if base_match:
             base_code = f"{base_match.group(1)} {base_match.group(2)}"
             if base_code not in base_to_courses:
@@ -469,7 +516,7 @@ def schedule_mixed_by_prereqs(
         
         # Strategy 3: Base code matching (e.g., "AMST 100" matches "AMST 100Y")
         if not prereqs:
-            base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", c)
+            base_match = re.match(r"([A-Z]{2,})\s+(\d{1,3})", c)
             if base_match:
                 base_code = f"{base_match.group(1)} {base_match.group(2)}"
                 if base_code in base_to_courses:
@@ -494,11 +541,11 @@ def schedule_mixed_by_prereqs(
                     G.add_edge(p_norm, c)
             else:
                 # Also check base code match (e.g., "MATH 311" matches "MATH 311M")
-                base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", p_norm)
+                base_match = re.match(r"([A-Z]{2,})\s+(\d{1,3})", p_norm)
                 if base_match:
                     prereq_base = f"{base_match.group(1)} {base_match.group(2)}"
                     for planned_course in planned_set:
-                        planned_base_match = re.match(r"([A-Z]{2,})\s+(\d{3})", planned_course)
+                        planned_base_match = re.match(r"([A-Z]{2,})\s+(\d{1,3})", planned_course)
                         if planned_base_match:
                             planned_base = f"{planned_base_match.group(1)} {planned_base_match.group(2)}"
                             if prereq_base == planned_base:
@@ -522,7 +569,7 @@ def schedule_mixed_by_prereqs(
             return prereq_norm
         if prereq_base:
             for planned_course in planned_set:
-                pm = re.match(r"([A-Z]{2,})\s+(\d{3})", planned_course)
+                pm = re.match(r"([A-Z]{2,})\s+(\d{1,3})", planned_course)
                 if pm and f"{pm.group(1)} {pm.group(2)}" == prereq_base:
                     return planned_course
         return None
@@ -534,7 +581,7 @@ def schedule_mixed_by_prereqs(
             return True
         for p in alts:
             p_norm = _normalize_course_code(p)
-            bm = re.match(r"([A-Z]{2,})\s+(\d{3})", p_norm)
+            bm = re.match(r"([A-Z]{2,})\s+(\d{1,3})", p_norm)
             p_base = f"{bm.group(1)} {bm.group(2)}" if bm else None
             if p_norm in completed_set or (p_base and p_base in completed_base_set):
                 return True
@@ -565,7 +612,7 @@ def schedule_mixed_by_prereqs(
         any_satisfied = False
         for p in alts:
             prereq_norm = _normalize_course_code(p)
-            bm = re.match(r"([A-Z]{2,})\s+(\d{3})", prereq_norm)
+            bm = re.match(r"([A-Z]{2,})\s+(\d{1,3})", prereq_norm)
             prereq_base = f"{bm.group(1)} {bm.group(2)}" if bm else None
 
             if prereq_norm in completed_set or (
@@ -1371,6 +1418,7 @@ def generate_semester_plan(
     }
     """
     flowchart = GraduationFlowchart(courses_csv_path, majors_csv_path)
+    course_titles, course_credits = _build_course_metadata(courses_csv_path)
     
     # Get major requirements
     row = flowchart._get_major_row(major_name)
@@ -1567,24 +1615,39 @@ def generate_semester_plan(
         if sem not in semesters:
             semesters[sem] = []
         semesters[sem].append(course)
-    
-    # Format as list
-    semester_list = []
-    for sem in sorted(semesters.keys()):
-        courses_in_sem = sorted(semesters[sem])
-        # Approximate credits (3 per course, can be enhanced)
-        credits = len(courses_in_sem) * 3
-        semester_list.append({
-            "semester": sem,
-            "courses": courses_in_sem,
-            "credits": credits
-        })
-    
+
     # Build prerequisites dict
     prerequisites = {}
     for course in planned_courses:
         if course in prereq_map:
             prerequisites[course] = prereq_map[course]
+
+    # Penn State Abington plans should explicitly show the first-year seminar
+    # for standard freshman-start plans. It is a 1-credit catalog course (PSU 1
+    # in the current course CSV; PSU 101 is supported if future data uses it).
+    completed_norm = {_normalize_course_code(c) for c in completed_courses or []}
+    seminar_code = _first_year_seminar_code(course_titles)
+    if seminar_code and not completed_norm:
+        seminar_norm = _normalize_course_code(seminar_code)
+        seminar_already_present = any(
+            _normalize_course_code(c) == seminar_norm
+            for sem_courses in semesters.values()
+            for c in sem_courses
+        )
+        if not seminar_already_present:
+            semesters.setdefault(1, []).append(seminar_norm)
+            prerequisites[seminar_norm] = []
+    
+    # Format as list
+    semester_list = []
+    for sem in sorted(semesters.keys()):
+        courses_in_sem = sorted(semesters[sem])
+        credits = sum(course_credits.get(_normalize_course_code(c), 3) for c in courses_in_sem)
+        semester_list.append({
+            "semester": sem,
+            "courses": courses_in_sem,
+            "credits": credits
+        })
     
     # Final universal backfill: guarantee requested credits are reachable.
     # This prevents truncated plans for majors with sparse explicit course-code coverage.
@@ -1612,7 +1675,7 @@ def generate_semester_plan(
             semester_list = []
             for sem in sorted(semesters.keys()):
                 courses_in_sem = sorted(semesters[sem])
-                credits = len(courses_in_sem) * 3
+                credits = sum(course_credits.get(_normalize_course_code(c), 3) for c in courses_in_sem)
                 semester_list.append({
                     "semester": sem,
                     "courses": courses_in_sem,
@@ -1622,5 +1685,7 @@ def generate_semester_plan(
     return {
         "semesters": semester_list,
         "total_credits": sum(s["credits"] for s in semester_list),
-        "prerequisites": prerequisites
+        "prerequisites": prerequisites,
+        "course_titles": course_titles,
+        "course_credits": course_credits,
     }
