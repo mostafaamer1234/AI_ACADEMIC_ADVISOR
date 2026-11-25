@@ -19,12 +19,12 @@ logger = logging.getLogger(__name__)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Now import LLM modules
-from LLM.main_copy import setup_environment
-from LLM.main_copy import aggregate_and_generate_response
-from LLM.main_copy import generate_conversational_response
-from LLM.main_copy import get_execution_trace_for_user
-from LLM.main_copy import clear_search_context_for_user
-from LLM.main_copy import reset_uploaded_transcript_state
+from LLM.advisor_engine import setup_environment
+from LLM.advisor_engine import aggregate_and_generate_response
+from LLM.advisor_engine import generate_conversational_response
+from LLM.advisor_engine import get_execution_trace_for_user
+from LLM.advisor_engine import clear_search_context_for_user
+from LLM.advisor_engine import reset_uploaded_transcript_state
 from LLM.majorsGraph import MajorGraph
 
 # Import Flask modules
@@ -495,4 +495,4 @@ def clear_major_graph_cache():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5002)
+    app.run(debug=os.getenv("FLASK_DEBUG") == "1", port=int(os.getenv("PORT", "5002")))

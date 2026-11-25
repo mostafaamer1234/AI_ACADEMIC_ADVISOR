@@ -3959,7 +3959,7 @@ def _build_semester_specific_major_draft(
 def _call_majors_retriever(query: str, ctx: Dict[str, Any]) -> str:
     if majors_retriever is None:
         # #region debug log (H-R1: retriever None-state)
-        _dbg("H-R1", "main_copy.py:_call_majors_retriever", "retriever is None", {
+        _dbg("H-R1", "advisor_engine.py:_call_majors_retriever", "retriever is None", {
             "query_first_120": (query or "")[:120],
         })
         # #endregion
@@ -3968,7 +3968,7 @@ def _call_majors_retriever(query: str, ctx: Dict[str, Any]) -> str:
         docs = majors_retriever.invoke(query)
     except Exception as e:
         # #region debug log (H-R2: retriever exception)
-        _dbg("H-R2", "main_copy.py:_call_majors_retriever", "exception", {
+        _dbg("H-R2", "advisor_engine.py:_call_majors_retriever", "exception", {
             "query_first_120": (query or "")[:120],
             "error_type": type(e).__name__,
             "error_str": str(e)[:300],
@@ -3977,7 +3977,7 @@ def _call_majors_retriever(query: str, ctx: Dict[str, Any]) -> str:
         print(f"⚠️ majors_retriever failed: {e}")
         return ""
     # #region debug log (H-R3: docs returned)
-    _dbg("H-R3", "main_copy.py:_call_majors_retriever", "docs returned", {
+    _dbg("H-R3", "advisor_engine.py:_call_majors_retriever", "docs returned", {
         "query_first_120": (query or "")[:120],
         "docs_count": len(docs or []),
         "docs_sizes": [len(getattr(d, "page_content", "") or "") for d in (docs or [])[:6]],
@@ -3992,7 +3992,7 @@ def _call_majors_retriever(query: str, ctx: Dict[str, Any]) -> str:
 def _call_course_retriever(query: str, ctx: Dict[str, Any]) -> str:
     if course_retriever is None:
         # #region debug log (H-R1: retriever None-state)
-        _dbg("H-R1", "main_copy.py:_call_course_retriever", "retriever is None", {
+        _dbg("H-R1", "advisor_engine.py:_call_course_retriever", "retriever is None", {
             "query_first_120": (query or "")[:120],
         })
         # #endregion
@@ -4002,7 +4002,7 @@ def _call_course_retriever(query: str, ctx: Dict[str, Any]) -> str:
         docs = course_retriever.invoke(expanded)
     except Exception as e:
         # #region debug log (H-R2: retriever exception)
-        _dbg("H-R2", "main_copy.py:_call_course_retriever", "exception", {
+        _dbg("H-R2", "advisor_engine.py:_call_course_retriever", "exception", {
             "query_first_120": (query or "")[:120],
             "expanded_first_120": (expanded if 'expanded' in locals() else "")[:120],
             "error_type": type(e).__name__,
@@ -4012,7 +4012,7 @@ def _call_course_retriever(query: str, ctx: Dict[str, Any]) -> str:
         print(f"⚠️ course_retriever failed: {e}")
         return ""
     # #region debug log (H-R3: docs returned)
-    _dbg("H-R3", "main_copy.py:_call_course_retriever", "docs returned", {
+    _dbg("H-R3", "advisor_engine.py:_call_course_retriever", "docs returned", {
         "query_first_120": (query or "")[:120],
         "expanded_first_120": (expanded or "")[:120],
         "docs_count": len(docs or []),
@@ -4200,7 +4200,7 @@ def _backfill_missing_prereqs(
     # Anything we've never asked the graph about needs a follow-up call.
     missing = [code for code in mentioned if code not in attempted]
     # #region debug log (H-B3: backfill scope)
-    _dbg("H-B3", "main_copy.py:_backfill_missing_prereqs", "scope", {
+    _dbg("H-B3", "advisor_engine.py:_backfill_missing_prereqs", "scope", {
         "mentioned_count": len(mentioned),
         "mentioned_sample": list(mentioned.keys())[:30],
         "attempted_count": len(attempted),
@@ -4332,7 +4332,7 @@ def _rewrite_inline_prereqs_from_graph(
     """
     if not response_text or not prereq_graph_text:
         # #region debug log (H-B1: rewrite no-op early)
-        _dbg("H-B1", "main_copy.py:_rewrite_inline_prereqs_from_graph", "early-exit empty input", {
+        _dbg("H-B1", "advisor_engine.py:_rewrite_inline_prereqs_from_graph", "early-exit empty input", {
             "response_len": len(response_text or ""),
             "graph_text_len": len(prereq_graph_text or ""),
         })
@@ -4340,7 +4340,7 @@ def _rewrite_inline_prereqs_from_graph(
         return response_text
     raw_map = _extract_raw_enforced_prereq_map(prereq_graph_text)
     # #region debug log (H-B1+H-B2: extracted graph map)
-    _dbg("H-B1+H-B2", "main_copy.py:_rewrite_inline_prereqs_from_graph", "extracted raw_map", {
+    _dbg("H-B1+H-B2", "advisor_engine.py:_rewrite_inline_prereqs_from_graph", "extracted raw_map", {
         "map_size": len(raw_map),
         "map_keys_sample": list(raw_map.keys())[:40],
         "graph_text_len": len(prereq_graph_text or ""),
@@ -4378,7 +4378,7 @@ def _rewrite_inline_prereqs_from_graph(
 
     out = "\n".join(fix_line(line) for line in response_text.splitlines())
     # #region debug log (H-B2: lines the rewrite couldn't fix)
-    _dbg("H-B1+H-B2", "main_copy.py:_rewrite_inline_prereqs_from_graph", "lines skipped (no map hit)", {
+    _dbg("H-B1+H-B2", "advisor_engine.py:_rewrite_inline_prereqs_from_graph", "lines skipped (no map hit)", {
         "skipped_count": len(skipped),
         "skipped_sample": skipped[:15],
     })
@@ -4412,7 +4412,7 @@ def _execute_retrieval_plan(
 
     ctx: Dict[str, Any] = {"user_id": user_id, "trace": trace, "plan": plan}
     # #region debug log (H-A1: per-step retrieval contract)
-    _dbg("H-A1+H-B1", "main_copy.py:_execute_retrieval_plan", "plan steps about to execute", {
+    _dbg("H-A1+H-B1", "advisor_engine.py:_execute_retrieval_plan", "plan steps about to execute", {
         "plan_majors": list(getattr(plan, "majors", None) or []),
         "step_count": len(plan.retrieval_plan or []),
         "steps": [
@@ -4434,7 +4434,7 @@ def _execute_retrieval_plan(
             continue
         results = callable_(query, ctx) or ""
         # #region debug log (H-B1: per-tool result size)
-        _dbg("H-A1+H-B1", "main_copy.py:_execute_retrieval_plan", "tool returned", {
+        _dbg("H-A1+H-B1", "advisor_engine.py:_execute_retrieval_plan", "tool returned", {
             "tool": tool,
             "query_first_120": query[:120],
             "result_len": len(results or ""),
@@ -4729,7 +4729,7 @@ def _build_major_lookup_draft(
                     if "prerequisites: not retrieved" in ln.lower()
                 ]
                 _resp_lower_dbg = (response or "").lower()
-                _dbg("H-A1+H-A3+H-B1+H-B2", "main_copy.py:_build_major_lookup_draft",
+                _dbg("H-A1+H-A3+H-B1+H-B2", "advisor_engine.py:_build_major_lookup_draft",
                      "post-rewrite executor draft snapshot", {
                     "response_len": len(response or ""),
                     "not_retrieved_count": len(_not_retrieved_lines),

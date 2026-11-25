@@ -22,14 +22,15 @@ if __name__ == '__main__':
         print(f"🐍 Python path: {sys.path[:3]}...")  # Show first 3 paths
         
         # Run the Flask app
-        app.run(debug=True, port=5002, host='127.0.0.1')
+        # Debug mode exposes the Werkzeug debugger (remote code execution); never enable it on a public host.
+        app.run(debug=os.getenv("FLASK_DEBUG") == "1", port=int(os.getenv("PORT", "5002")), host=os.getenv("HOST", "127.0.0.1"))
         
     except ImportError as e:
         print(f"❌ Import Error: {e}")
         print("🔍 Make sure you're running this from the LLMAcadamic-Advisor directory")
         print("📋 Required files:")
         print("   - api/api.py")
-        print("   - LLM/main_copy.py")
+        print("   - LLM/advisor_engine.py")
         print("   - LLM/majorsGraph.py")
         sys.exit(1)
     except Exception as e:
