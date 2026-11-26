@@ -1,5 +1,7 @@
 # IAAS
 
+**Project page: [ai-advisor-mostafa.vercel.app](https://ai-advisor-mostafa.vercel.app)**. The three-agent workflow, plus the independent plan referee running in your browser against the 9,248-course catalog.
+
 **Intelligent Academic Advising System** is a Penn State-focused advising platform that combines a Custom multi-agent orchestration built on top of LangChain model and retrieval primitives, React frontend, a lightweight Node authentication service, and a Flask-based RAG AI orchestration engine for transcript-aware academic guidance.
 
 The project is built around a practical AI engineering pattern: use LLMs for reasoning, planning, and synthesis, while keeping critical academic logic deterministic, observable, and tool-driven.
