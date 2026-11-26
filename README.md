@@ -9,7 +9,7 @@
 
 The project is built around a practical AI engineering pattern: use LLMs for reasoning, planning, and synthesis, while keeping critical academic logic deterministic, observable, and tool-driven.
 
-**Project page: [ai-academic-advisor.vercel.app](https://ai-academic-advisor.vercel.app)**. The three-agent workflow, plus the independent plan referee running in your browser against the 9,248-course catalog. The page lives in `site/` and its data comes from `python -m evals.export_site_catalog`.
+**Project page: [ai-advisor-mostafa.vercel.app](https://ai-advisor-mostafa.vercel.app)**. The three-agent workflow, plus the independent plan referee running in your browser against the 9,248-course catalog. The page lives in `site/` and its data comes from `python -m evals.export_site_catalog`.
 
 
 Hosted on AWS : https://3.145.213.72/ 
