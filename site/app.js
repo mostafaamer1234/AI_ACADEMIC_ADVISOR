@@ -23,7 +23,7 @@ function render(r) {
   const row = (label, items) => `<li><b>${label}<em class="${items.length ? "bad" : "ok"}">${items.length || "None"}</em></b>${items.map((i) => `<span>${esc(i)}</span>`).join("")}</li>`;
   $("report").innerHTML = `
     <p class="verdict ${r.passed ? "pass" : "fail"}">${r.passed ? "Plan passes." : "Plan fails."}</p>
-    <p class="q-small">${r.semesters} semesters, ${r.courses} courses checked.</p>
+    <p class="q-small">${r.semesters} semester${r.semesters === 1 ? "" : "s"}, ${r.courses} course${r.courses === 1 ? "" : "s"} checked.</p>
     <ul class="checks">
       ${row("Courses not in the catalog", r.unknown_courses)}
       ${row("Prerequisites out of order", r.prereq_violations)}
