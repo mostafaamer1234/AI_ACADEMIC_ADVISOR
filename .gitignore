@@ -53,3 +53,4 @@ IAAS/LLMAcadamic-Advisor/LLM/cache/
 chroma_courses/
 IAAS/client/build/
 evals/results/
+.vercel

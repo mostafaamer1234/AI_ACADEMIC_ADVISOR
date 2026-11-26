@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI Academic Advisor · LLM plans, deterministic checks</title>
+  <meta name="description" content="A multi-agent academic advisor that plans semesters with an LLM and checks every plan against a 9,248-course catalog. Try the plan referee in your browser." />
+  <link rel="stylesheet" href="quiet.css" />
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <nav class="q-nav">
+    <div class="q-wrap">
+      <span class="q-brand">AI Academic Advisor</span>
+      <div class="q-links">
+        <a href="#agents">Agents</a>
+        <a href="#referee">Referee</a>
+        <a href="https://github.com/mostafaamer1234/AI_ACADEMIC_ADVISOR">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <header class="q-wrap q-hero">
+      <p class="q-eyebrow">Multi-agent LLM system · RAG</p>
+      <h1 class="q-title">The LLM drafts the plan. <span class="q-muted">Something that isn't an LLM checks it.</span></h1>
+      <p class="q-lede">An advising system for Penn State students: transcript upload, graduation plans, course and policy answers. Reasoning is left to the model. Prerequisites, credits and catalog facts are not.</p>
+    </header>
+
+    <section class="q-wrap" id="agents">
+      <div class="q-figures">
+        <div class="q-figure"><div class="q-num">3</div><div class="q-label">agents: plan the request, execute with tools, validate and write</div></div>
+        <div class="q-figure"><div class="q-num">9,248</div><div class="q-label">catalog courses the referee knows, 2,541 with parsed prerequisites</div></div>
+        <div class="q-figure"><div class="q-num">124</div><div class="q-label">offline pipeline tests in CI, no API keys needed</div></div>
+      </div>
+
+      <div class="flow">
+        <div class="ask">
+          <p class="q-caps">A student asks</p>
+          <p class="quote">“I just finished CMPSC 132. Plan my next two semesters for the CS major.”</p>
+        </div>
+        <ol class="agents">
+          <li><b>Orchestrator</b><span>Reads the message with the conversation history, resolves the follow-up, and returns a structured plan: domain transcript, deliverable two-semester plan, allowed tools, success criteria.</span></li>
+          <li><b>Executor</b><span>Retrieves the transcript, major requirements and course data from local RAG stores, then calls the deterministic graduation planner. Web research only for fresh facts, with sources validated.</span></li>
+          <li><b>Finalizer</b><span>Checks the result against the success criteria, rejects unsupported claims, and writes the answer. Every request can return a full debug trace.</span></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="q-wrap q-section" id="referee">
+      <h2 class="q-h2">Try the referee. <span class="q-muted">It runs in your browser.</span></h2>
+      <p class="q-lede referee-lede">The evaluation suite scores generated plans with an independent checker built straight from the catalog, so a bug in the advisor's own validators can't hide. Edit a plan or pick an example.</p>
+      <div class="bar">
+        <div class="q-seg" id="examples" role="group" aria-label="Example plans"></div>
+        <button class="q-btn" id="check" disabled>Loading…</button>
+      </div>
+      <div class="ref">
+        <textarea id="plan" spellcheck="false" aria-label="Semester plan"></textarea>
+        <div class="report" id="report"><p class="q-small">Starting Python in the browser…</p></div>
+      </div>
+      <p class="q-note">Format: a line starting with "Semester N", course codes like CMPSC 132, and an optional "Total credits: N". Credit loads outside 12–19 are flagged. Honors variants such as MATH 140H count toward the base course.</p>
+    </section>
+
+    <section class="q-wrap q-section">
+      <h2 class="q-h2">Built to be trusted, <span class="q-muted">and honest about its gaps.</span></h2>
+      <div class="q-steps">
+        <div class="q-step"><h3 class="q-h3">Grounded</h3><p>Answers come from retrieval over transcripts, courses, majors and policy documents before any web search.</p></div>
+        <div class="q-step"><h3 class="q-h3">Deterministic where it counts</h3><p>Graduation planning is code, not generation, so prerequisite order and credit loads are computed.</p></div>
+        <div class="q-step"><h3 class="q-h3">Measured</h3><p>An eval harness reports hallucinated courses, prerequisite violations, duplicates and latency over 15 requests in six majors.</p></div>
+        <div class="q-step"><h3 class="q-h3">Not production yet</h3><p>Auth is lightweight and some state is process-local. The full app needs an OpenAI key and runs locally or in Docker.</p></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="q-foot">
+    <div class="q-wrap">
+      <span>AI Academic Advisor · Mostafa Amer</span>
+      <a href="https://github.com/mostafaamer1234/AI_ACADEMIC_ADVISOR">Source on GitHub</a>
+    </div>
+  </footer>
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
