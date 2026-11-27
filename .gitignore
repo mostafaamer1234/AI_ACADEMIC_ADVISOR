@@ -48,3 +48,9 @@ IAAS/LLMAcadamic-Advisor/LLM/*.pdf
 
 # Generated graph cache (regenerated on demand from CSVs + code)
 IAAS/LLMAcadamic-Advisor/LLM/cache/
+
+# Stale vector DB snapshot and frontend build output (rebuilt at runtime / by npm run build)
+chroma_courses/
+IAAS/client/build/
+evals/results/
+.vercel

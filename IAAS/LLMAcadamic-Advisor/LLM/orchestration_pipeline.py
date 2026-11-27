@@ -452,7 +452,7 @@ def _looks_like_plan_request(text: str) -> bool:
 # Advisor persona.
 #
 # Single source of truth for the agent's voice and behavior contract. Imported
-# by the executor drafters in main_copy.py so the *draft* arrives with the
+# by the executor drafters in advisor_engine.py so the *draft* arrives with the
 # right voice, and used in the Finalizer system prompt below so the polish
 # layer applies the same contract end-to-end.
 #

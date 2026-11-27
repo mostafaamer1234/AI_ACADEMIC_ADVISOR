@@ -1,0 +1,15 @@
+{"id": "cs-fresh-8", "question": "I'm a new Computer Science major at Penn State Abington with no credits yet. Give me a full 8-semester graduation plan."}
+{"id": "cs-after-cmpsc131", "question": "I'm a Computer Science major. I already completed CMPSC 131, MATH 140 and ENGL 15. Plan my remaining semesters."}
+{"id": "cs-next-sem", "question": "I'm a CS major who finished CMPSC 132 and MATH 141. What should I take next semester? Give a one-semester plan."}
+{"id": "ist-fresh-8", "question": "Make an 8-semester plan for an Information Sciences and Technology major starting from zero credits."}
+{"id": "psych-fresh-8", "question": "I'm starting a Psychology B.S. at Abington. Please give me a semester-by-semester plan to graduate in 4 years."}
+{"id": "bio-fresh-8", "question": "Create a 4-year semester-by-semester plan for a Biology major with no prior credits."}
+{"id": "math-fresh-8", "question": "Build me an 8-semester Mathematics major plan from the start."}
+{"id": "business-fresh-8", "question": "I'm a Business major with no credits. Give me a semester-by-semester graduation plan."}
+{"id": "cs-transfer-4", "question": "I transferred in as a CS major with 60 credits including CMPSC 131, CMPSC 132, MATH 140 and MATH 141. Plan my last 4 semesters."}
+{"id": "cs-summer", "question": "I'm a Computer Science sophomore who finished CMPSC 131 and CMPSC 132. Plan the next 4 semesters so I can graduate on time."}
+{"id": "ist-two-sem", "question": "As an IST major who completed IST 110 and IST 140, plan my next two semesters."}
+{"id": "psych-next-sem", "question": "I'm a Psychology major and finished PSYCH 100. What courses should I take next semester? Give a semester plan."}
+{"id": "cs-math-minor", "question": "I'm a CS major who wants a Mathematics minor. Give me an 8-semester plan that includes both."}
+{"id": "bio-premed", "question": "Biology major on a pre-med track with no credits yet: give me a 4-year semester plan including chemistry and physics."}
+{"id": "cs-light-load", "question": "I'm a CS major who can only take 12 credits per semester. Plan my first 4 semesters."}

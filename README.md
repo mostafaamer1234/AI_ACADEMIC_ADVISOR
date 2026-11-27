@@ -1,10 +1,16 @@
-# IAAS
+# IAAS: AI Academic Advisor
 
-**Project page: [ai-advisor-mostafa.vercel.app](https://ai-advisor-mostafa.vercel.app)**. The three-agent workflow, plus the independent plan referee running in your browser against the 9,248-course catalog.
+![CI](https://github.com/mostafaamer1234/AI_ACADEMIC_ADVISOR/actions/workflows/ci.yml/badge.svg)
+![Python](https://img.shields.io/badge/python-3.11-blue)
+![React](https://img.shields.io/badge/frontend-React-61dafb)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
 **Intelligent Academic Advising System** is a Penn State-focused advising platform that combines a Custom multi-agent orchestration built on top of LangChain model and retrieval primitives, React frontend, a lightweight Node authentication service, and a Flask-based RAG AI orchestration engine for transcript-aware academic guidance.
 
 The project is built around a practical AI engineering pattern: use LLMs for reasoning, planning, and synthesis, while keeping critical academic logic deterministic, observable, and tool-driven.
+
+**Try it: [ai-advisor-mostafa.vercel.app](https://ai-advisor-mostafa.vercel.app)**. Open the link and chat with Leo right away: semester plans that respect prerequisites (checked by the independent referee), course and prerequisite lookups across the 9,248-course catalog, major requirements and answers from the advising FAQ. This public version needs no account or API key. It runs the advisor's deterministic tools in your browser, without the LLM agents or transcript upload of the full app below. [About the project](https://ai-advisor-mostafa.vercel.app/about). The site lives in `site/`. Its data comes from `python -m evals.export_site_chat` (needs `wordninja` and `pypdf`) and `python -m evals.export_site_catalog`.
+
 
 Hosted on AWS : https://3.145.213.72/ 
 
@@ -297,7 +303,7 @@ This design keeps the system both grounded and adaptable: local retrieval handle
 │   │   ├── api/
 │   │   │   └── api.py
 │   │   ├── LLM/
-│   │   │   ├── main_copy.py
+│   │   │   ├── advisor_engine.py
 │   │   │   ├── orchestration_pipeline.py
 │   │   │   ├── web_search_pipeline.py
 │   │   │   ├── graduationFlowchart.py
@@ -403,10 +409,12 @@ This starts:
 
 ## Testing
 
-### Targeted AI pipeline tests
+The full offline suite (124 pipeline tests, with no API keys needed) runs in CI along with the React tests and a Docker build:
 
 ```bash
-python3 -m unittest IAAS/test_orchestration_pipeline.py IAAS/test_web_search_pipeline.py
+cd IAAS && pytest -q                # orchestrator, executor, finalizer, web research, session store
+pytest -q evals                     # independent plan-checker tests
+cd IAAS/client && CI=true npx react-scripts test --watchAll=false
 ```
 
 ### Manual conversation smoke test
@@ -416,6 +424,36 @@ python IAAS/test_ai_conversation.py
 ```
 
 The Flask service must already be running for the manual conversation test.
+
+## Evaluation
+
+`evals/` measures generated graduation plans with a referee that is **independent of the pipeline's own validators**. It is built directly from the 9,248-course catalog (`processed_psu_courses.csv`), so a bug in the advisor's checks cannot hide in the eval.
+
+For each plan it reports:
+
+- **Hallucinated courses**: codes that do not exist in the catalog.
+- **Prerequisite-order violations**: catalog prerequisites such as `(CMPSC 122 or CMPSC 132) and (CMPSC 360 or MATH 311W)` are parsed into AND-of-OR groups and checked semester by semester. Honors and variant suffixes (for example `MATH 140H`) count toward the base course. Ambiguous prose and "or placement exam" alternatives are not enforced, which avoids false failures.
+- **Duplicate courses** and **semesters outside 12–19 credits**.
+
+```bash
+# live: 15 plan requests across CS, IST, Psychology, Biology, Math and Business (evals/requests.jsonl)
+python IAAS/LLMAcadamic-Advisor/start_flask.py          # requires OPENAI_API_KEY
+python -m evals.run_eval --api http://localhost:5002    # prints a markdown scorecard, saves evals/results/*.json
+
+# offline: score plans you saved earlier
+python -m evals.run_eval --plans saved_plans.jsonl
+```
+
+The scorecard reports the pass rate, hallucination rate, prerequisite violations, duplicates, credit-load issues and median/p90 latency. Use it, together with advisor review of a sample of plans, as the evidence behind any accuracy figure quoted for this project.
+
+## Running the API in Docker
+
+```bash
+docker build -t ai-academic-advisor-api .
+docker run -p 5002:5002 -e OPENAI_API_KEY=... ai-academic-advisor-api
+```
+
+The container runs gunicorn as a non-root user. Flask's debug mode is now off unless `FLASK_DEBUG=1`, because the Werkzeug debugger allows remote code execution on a public host.
 
 ## Current Status
 
@@ -449,6 +487,6 @@ If you want to understand the system quickly, start here:
 2. `IAAS/client/src/services/apiService.js`
 3. `IAAS/LLMAcadamic-Advisor/api/api.py`
 4. `IAAS/LLMAcadamic-Advisor/LLM/orchestration_pipeline.py`
-5. `IAAS/LLMAcadamic-Advisor/LLM/main_copy.py`
+5. `IAAS/LLMAcadamic-Advisor/LLM/advisor_engine.py`
 6. `IAAS/LLMAcadamic-Advisor/LLM/web_search_pipeline.py`
 7. `IAAS/LLMAcadamic-Advisor/LLM/graduationFlowchart.py`

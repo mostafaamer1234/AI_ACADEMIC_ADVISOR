@@ -1,0 +1,8 @@
+.git
+.venv
+**/__pycache__
+**/.DS_Store
+IAAS/client
+chroma_courses
+**/.env
+evals/results

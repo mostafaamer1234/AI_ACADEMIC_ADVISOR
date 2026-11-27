@@ -13,9 +13,9 @@ from orchestration_pipeline import ExecutorResult, build_orchestration_plan, run
 
 MAIN_COPY_IMPORT_ERROR = None
 try:
-    import main_copy  # noqa: E402
+    import advisor_engine  # noqa: E402
 except Exception as exc:  # pragma: no cover - environment-dependent
-    main_copy = None
+    advisor_engine = None
     MAIN_COPY_IMPORT_ERROR = exc
 
 
@@ -226,22 +226,22 @@ class OrchestrationPipelineTests(unittest.TestCase):
         self.assertIn("web_search", plan.allowed_tools)
 
     def test_generate_conversational_response_slices_prior_plan_followup(self):
-        if main_copy is None:
-            self.skipTest(f"main_copy unavailable in this environment: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine unavailable in this environment: {MAIN_COPY_IMPORT_ERROR}")
         user_id = "pipeline-followup-test"
-        main_copy.execution_trace_store.clear()
+        advisor_engine.execution_trace_store.clear()
         history = [
             {"role": "user", "content": "give me a graduation plan for a sophmore in business managment"},
             {"role": "assistant", "content": FULL_PLAN_TEXT},
         ]
 
-        with patch.object(main_copy, "llm_classifier", FakeLLM([""])), \
-             patch.object(main_copy, "llm1", FakeLLM([""])), \
-             patch.object(main_copy, "llm2", FakeLLM([""])), \
-             patch.object(main_copy, "has_transcript", False), \
-             patch.object(main_copy, "stored_pdf_docs", None), \
-             patch.object(main_copy, "latest_student_data", None):
-            response = main_copy.generate_conversational_response(
+        with patch.object(advisor_engine, "llm_classifier", FakeLLM([""])), \
+             patch.object(advisor_engine, "llm1", FakeLLM([""])), \
+             patch.object(advisor_engine, "llm2", FakeLLM([""])), \
+             patch.object(advisor_engine, "has_transcript", False), \
+             patch.object(advisor_engine, "stored_pdf_docs", None), \
+             patch.object(advisor_engine, "latest_student_data", None):
+            response = advisor_engine.generate_conversational_response(
                 "how about just a plan for next semester only",
                 history,
                 user_id=user_id,
@@ -251,15 +251,15 @@ class OrchestrationPipelineTests(unittest.TestCase):
         self.assertIn("Semester 3:", response)
         self.assertNotIn("Semester 4:", response)
 
-        trace = main_copy.get_execution_trace_for_user(user_id)
+        trace = advisor_engine.get_execution_trace_for_user(user_id)
         self.assertEqual(trace["orchestrator"]["plan_scope"], "single_semester")
         self.assertEqual(trace["executor"]["attempts"][0]["result"]["tools_used"], [])
 
     def test_generate_conversational_response_recalls_major_and_year_from_history(self):
-        if main_copy is None:
-            self.skipTest(f"main_copy unavailable in this environment: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine unavailable in this environment: {MAIN_COPY_IMPORT_ERROR}")
         user_id = "pipeline-profile-recall-test"
-        main_copy.execution_trace_store.clear()
+        advisor_engine.execution_trace_store.clear()
         history = [
             {"role": "user", "content": "give me a graduation plan for a junior computer science major"},
             {"role": "assistant", "content": MARKDOWN_PLAN_TEXT},
@@ -280,13 +280,13 @@ class OrchestrationPipelineTests(unittest.TestCase):
           "success_criteria": "User confirms their academic year and major."
         }"""
 
-        with patch.object(main_copy, "llm_classifier", FakeLLM([bad_orchestrator_json])), \
-             patch.object(main_copy, "llm1", FakeLLM([""])), \
-             patch.object(main_copy, "llm2", FakeLLM([""])), \
-             patch.object(main_copy, "has_transcript", False), \
-             patch.object(main_copy, "stored_pdf_docs", None), \
-             patch.object(main_copy, "latest_student_data", None):
-            response = main_copy.generate_conversational_response(
+        with patch.object(advisor_engine, "llm_classifier", FakeLLM([bad_orchestrator_json])), \
+             patch.object(advisor_engine, "llm1", FakeLLM([""])), \
+             patch.object(advisor_engine, "llm2", FakeLLM([""])), \
+             patch.object(advisor_engine, "has_transcript", False), \
+             patch.object(advisor_engine, "stored_pdf_docs", None), \
+             patch.object(advisor_engine, "latest_student_data", None):
+            response = advisor_engine.generate_conversational_response(
                 "what year and major am i again?",
                 history[:-1],
                 user_id=user_id,
@@ -297,7 +297,7 @@ class OrchestrationPipelineTests(unittest.TestCase):
         self.assertIn("junior", response.lower())
         self.assertIn("computer science", response.lower())
 
-        trace = main_copy.get_execution_trace_for_user(user_id)
+        trace = advisor_engine.get_execution_trace_for_user(user_id)
         self.assertEqual(trace["orchestrator"]["executor_path"], "conversation_profile_recall")
         self.assertEqual(trace["orchestrator"]["plan_scope"], "direct_answer")
 
@@ -352,22 +352,22 @@ class StructuralRoutingRegressionTests(unittest.TestCase):
         "web_search",
     ]
 
-    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    @unittest.skipIf(advisor_engine is None, f"advisor_engine unavailable: {MAIN_COPY_IMPORT_ERROR}")
     def test_legacy_route_query_honors_llm_before_keyword_fallback(self):
         """The fallback router must not let keyword/course-code rules override
         an LLM classification. This guards the same failure class as the
         double-major issue: structured model routing owns the route, and
         deterministic rules are only a fallback.
         """
-        with patch.object(main_copy, "_classify_intent_llm", return_value="policy"):
-            route = main_copy.route_query("What is the CMPSC 488 late drop policy?")
+        with patch.object(advisor_engine, "_classify_intent_llm", return_value="policy"):
+            route = advisor_engine.route_query("What is the CMPSC 488 late drop policy?")
 
         self.assertEqual(route, "policy")
 
-    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    @unittest.skipIf(advisor_engine is None, f"advisor_engine unavailable: {MAIN_COPY_IMPORT_ERROR}")
     def test_legacy_route_query_uses_keywords_only_when_llm_classification_fails(self):
-        with patch.object(main_copy, "_classify_intent_llm", return_value=None):
-            route = main_copy.route_query("What are the prerequisites for CMPSC 488?")
+        with patch.object(advisor_engine, "_classify_intent_llm", return_value=None):
+            route = advisor_engine.route_query("What are the prerequisites for CMPSC 488?")
 
         self.assertEqual(route, "course")
 
@@ -655,7 +655,7 @@ class StructuralRoutingRegressionTests(unittest.TestCase):
                 self.assertTrue(tools, f"{domain}/{path} has empty canonical tool set")
 
 
-@unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+@unittest.skipIf(advisor_engine is None, f"advisor_engine unavailable: {MAIN_COPY_IMPORT_ERROR}")
 class SemesterSpecificMajorRoutingTests(unittest.TestCase):
     """The routing contract for 'specific semester of a specific major' questions.
 
@@ -680,27 +680,27 @@ class SemesterSpecificMajorRoutingTests(unittest.TestCase):
         ]
         for question, sem_n, year, horizon in cases:
             with self.subTest(question=question):
-                out = main_copy._extract_target_semester_request(question)
+                out = advisor_engine._extract_target_semester_request(question)
                 self.assertIsNotNone(out, f"expected a target for: {question}")
                 self.assertEqual(out["semester_number"], sem_n)
                 self.assertEqual(out["year_level"], year)
                 self.assertEqual(out["horizon"], horizon)
 
     def test_extract_target_semester_year_and_term(self):
-        out = main_copy._extract_target_semester_request("sophomore fall plan for CS")
+        out = advisor_engine._extract_target_semester_request("sophomore fall plan for CS")
         self.assertEqual(out, {"semester_number": 3, "year_level": "sophomore", "horizon": 1})
-        out = main_copy._extract_target_semester_request("freshman spring for biology")
+        out = advisor_engine._extract_target_semester_request("freshman spring for biology")
         self.assertEqual(out, {"semester_number": 2, "year_level": "freshman", "horizon": 1})
-        out = main_copy._extract_target_semester_request("junior year classes for finance")
+        out = advisor_engine._extract_target_semester_request("junior year classes for finance")
         self.assertEqual(out, {"semester_number": 5, "year_level": "junior", "horizon": 2})
 
     def test_extract_target_semester_none_for_generic_major_q(self):
-        self.assertIsNone(main_copy._extract_target_semester_request("what are the CS major requirements"))
-        self.assertIsNone(main_copy._extract_target_semester_request("give me a graduation plan for CS"))
-        self.assertIsNone(main_copy._extract_target_semester_request(""))
+        self.assertIsNone(advisor_engine._extract_target_semester_request("what are the CS major requirements"))
+        self.assertIsNone(advisor_engine._extract_target_semester_request("give me a graduation plan for CS"))
+        self.assertIsNone(advisor_engine._extract_target_semester_request(""))
 
     def test_extract_semester_block_by_number_picks_correct_block(self):
-        block = main_copy._extract_semester_block_by_number(FULL_PLAN_TEXT, 4)
+        block = advisor_engine._extract_semester_block_by_number(FULL_PLAN_TEXT, 4)
         self.assertIsNotNone(block)
         self.assertIn("Semester 4:", block)
         self.assertIn("Total Credits: 15", block)
@@ -721,13 +721,13 @@ class SemesterSpecificMajorRoutingTests(unittest.TestCase):
             "MATH 141 (prerequisites: MATH 140)\n"
             "Total Credits: 15"
         )
-        with patch.object(main_copy, "generate_plan_from_major_and_year", return_value=fake_plan) as planner, \
+        with patch.object(advisor_engine, "generate_plan_from_major_and_year", return_value=fake_plan) as planner, \
              patch.object(
-                 main_copy,
+                 advisor_engine,
                  "_extract_major_year_from_request_context",
                  return_value=("Computer Science, B.S. (Abington)", None),
              ):
-            response, tools_used, metadata = main_copy._build_semester_specific_major_draft(
+            response, tools_used, metadata = advisor_engine._build_semester_specific_major_draft(
                 user_question="first semester courses for computer science",
                 target={"semester_number": 1, "year_level": "freshman", "horizon": 1},
                 conversation_history=[],
@@ -753,9 +753,9 @@ class SemesterSpecificMajorRoutingTests(unittest.TestCase):
             "STAT 318 (prerequisites: None)\n"
             "Total Credits: 15"
         )
-        with patch.object(main_copy, "aggregate_and_generate_response", return_value=personalized) as agg, \
-             patch.object(main_copy, "generate_plan_from_major_and_year") as planner:
-            response, tools_used, metadata = main_copy._build_semester_specific_major_draft(
+        with patch.object(advisor_engine, "aggregate_and_generate_response", return_value=personalized) as agg, \
+             patch.object(advisor_engine, "generate_plan_from_major_and_year") as planner:
+            response, tools_used, metadata = advisor_engine._build_semester_specific_major_draft(
                 user_question="what should I take next semester",
                 target={"semester_number": 5, "year_level": "junior", "horizon": 1},
                 conversation_history=[],
@@ -774,11 +774,11 @@ class SemesterSpecificMajorRoutingTests(unittest.TestCase):
         """When we can't extract the major and the student has no transcript,
         return empty so the dispatch can fall through to generic major_lookup."""
         with patch.object(
-            main_copy,
+            advisor_engine,
             "_extract_major_year_from_request_context",
             return_value=(None, None),
         ):
-            response, tools_used, metadata = main_copy._build_semester_specific_major_draft(
+            response, tools_used, metadata = advisor_engine._build_semester_specific_major_draft(
                 user_question="what should I take first semester",
                 target={"semester_number": 1, "year_level": "freshman", "horizon": 1},
                 conversation_history=[],
@@ -907,7 +907,7 @@ class PersonalityRegressionTests(unittest.TestCase):
         self.assertIn(semester_block, final_response, "Semester block must survive finalizer verbatim")
         self.assertIn("Things to consider next", final_response)
 
-    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    @unittest.skipIf(advisor_engine is None, f"advisor_engine unavailable: {MAIN_COPY_IMPORT_ERROR}")
     def test_user_facing_executor_drafters_inject_persona(self):
         """The major/policy/general-chat drafters compose their own LLM prose
         and therefore must arrive with the right voice — relying on the
@@ -921,8 +921,8 @@ class PersonalityRegressionTests(unittest.TestCase):
             "_build_general_academic_chat_draft",
             "_run_executor_stage",
         ):
-            fn = getattr(main_copy, fn_name, None)
-            self.assertIsNotNone(fn, f"main_copy is missing {fn_name}")
+            fn = getattr(advisor_engine, fn_name, None)
+            self.assertIsNotNone(fn, f"advisor_engine is missing {fn_name}")
             source = inspect.getsource(fn)
             self.assertIn(
                 "ADVISOR_PERSONA",
@@ -930,7 +930,7 @@ class PersonalityRegressionTests(unittest.TestCase):
                 f"{fn_name} must inject ADVISOR_PERSONA into its system prompt",
             )
 
-    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    @unittest.skipIf(advisor_engine is None, f"advisor_engine unavailable: {MAIN_COPY_IMPORT_ERROR}")
     def test_missing_info_uses_warm_soft_ask(self):
         """When critical info is missing (here: major + year for a plan
         request), the response must be a warm soft-ask, not a one-liner.
@@ -955,9 +955,9 @@ class PersonalityRegressionTests(unittest.TestCase):
             success_criteria=["Return a graduation plan."],
         )
 
-        with patch.object(main_copy, "_extract_major_year_from_request_context", return_value=(None, None)), \
-             patch.object(main_copy, "aggregate_and_generate_response", return_value=""):
-            response, tools_used, metadata = main_copy._build_transcript_plan_draft(
+        with patch.object(advisor_engine, "_extract_major_year_from_request_context", return_value=(None, None)), \
+             patch.object(advisor_engine, "aggregate_and_generate_response", return_value=""):
+            response, tools_used, metadata = advisor_engine._build_transcript_plan_draft(
                 plan=plan,
                 user_question="give me a plan",
                 conversation_history=[],
@@ -1014,15 +1014,15 @@ class PromptEngineeringRegressionTests(unittest.TestCase):
         self.assertNotIn(blocked_word, clean.lower())
         self.assertIn("[removed]", clean)
 
-    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    @unittest.skipIf(advisor_engine is None, f"advisor_engine unavailable: {MAIN_COPY_IMPORT_ERROR}")
     def test_foul_language_requests_are_refused_before_model_call(self):
-        self.assertTrue(main_copy._is_foul_language_request("please list curse words"))
-        refusal = main_copy._foul_language_refusal()
+        self.assertTrue(advisor_engine._is_foul_language_request("please list curse words"))
+        refusal = advisor_engine._foul_language_refusal()
         self.assertIn("can't help", refusal)
         self.assertIn("Leo", refusal)
         self.assertIn("endorse foul language", refusal)
 
-        response = main_copy.generate_conversational_response(
+        response = advisor_engine.generate_conversational_response(
             "please list curse words",
             [],
             user_id="clean-language-test",
@@ -1037,14 +1037,14 @@ class PromptEngineeringRegressionTests(unittest.TestCase):
             inspect.getsource(orchestration_pipeline.build_orchestration_plan),
             inspect.getsource(orchestration_pipeline.run_finalizer_stage),
         ]
-        if main_copy is not None:
+        if advisor_engine is not None:
             prompt_sources.extend([
-                inspect.getsource(main_copy._classify_intent_llm),
-                inspect.getsource(main_copy._build_reasoning_plan),
-                inspect.getsource(main_copy._build_policy_lookup_draft),
-                inspect.getsource(main_copy._build_major_lookup_draft),
-                inspect.getsource(main_copy._build_general_academic_chat_draft),
-                inspect.getsource(main_copy._run_executor_stage),
+                inspect.getsource(advisor_engine._classify_intent_llm),
+                inspect.getsource(advisor_engine._build_reasoning_plan),
+                inspect.getsource(advisor_engine._build_policy_lookup_draft),
+                inspect.getsource(advisor_engine._build_major_lookup_draft),
+                inspect.getsource(advisor_engine._build_general_academic_chat_draft),
+                inspect.getsource(advisor_engine._run_executor_stage),
             ])
 
         for source in prompt_sources:
@@ -1158,7 +1158,7 @@ class RetrievalPlanContractTests(unittest.TestCase):
         self.assertEqual(majors_step["query"], "Computer Science B.S. Abington requirements")
         self.assertIn("Build a 15-credit", plan.synthesis_brief)
 
-    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    @unittest.skipIf(advisor_engine is None, f"advisor_engine unavailable: {MAIN_COPY_IMPORT_ERROR}")
     def test_executor_dispatches_every_retrieval_plan_step(self):
         """``_execute_retrieval_plan`` is the executor's only path to data.
         It must call every tool the planner listed, with the planner's
@@ -1199,8 +1199,8 @@ class RetrievalPlanContractTests(unittest.TestCase):
             "course_retriever":   fake_tool("course_retriever", "COURSES_RESULT"),
             "prerequisite_graph": fake_tool("prerequisite_graph", "PREREQ_RESULT"),
         }
-        with patch.dict(main_copy.EXECUTOR_TOOLS, fake_registry, clear=True):
-            bundle, tools_used = main_copy._execute_retrieval_plan(plan)
+        with patch.dict(advisor_engine.EXECUTOR_TOOLS, fake_registry, clear=True):
+            bundle, tools_used = advisor_engine._execute_retrieval_plan(plan)
 
         self.assertEqual(
             recorded,
@@ -1213,7 +1213,7 @@ class RetrievalPlanContractTests(unittest.TestCase):
         self.assertEqual(set(bundle.keys()), {"majors_retriever", "course_retriever", "prerequisite_graph"})
         self.assertEqual(bundle["prerequisite_graph"]["results"], "PREREQ_RESULT")
 
-    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    @unittest.skipIf(advisor_engine is None, f"advisor_engine unavailable: {MAIN_COPY_IMPORT_ERROR}")
     def test_synthesis_prompt_contains_every_retrieved_section(self):
         """The synthesis LLM must see a labeled bundle — one ### TOOL header
         per tool that returned content — so it can attribute claims to
@@ -1247,9 +1247,9 @@ class RetrievalPlanContractTests(unittest.TestCase):
         }
         fake_llm = FakeLLM(["Semester 1:\nCMPSC 131\nTotal Credits: 3"])
 
-        with patch.dict(main_copy.EXECUTOR_TOOLS, fake_registry, clear=True), \
-             patch.object(main_copy, "llm2", fake_llm):
-            response, tools_used, metadata = main_copy._build_major_lookup_draft(
+        with patch.dict(advisor_engine.EXECUTOR_TOOLS, fake_registry, clear=True), \
+             patch.object(advisor_engine, "llm2", fake_llm):
+            response, tools_used, metadata = advisor_engine._build_major_lookup_draft(
                 user_question="first semester CS",
                 trace=None,
                 allowed_tools={"majors_retriever", "course_retriever", "prerequisite_graph"},
@@ -1752,11 +1752,11 @@ class InlinePrereqContractTests(unittest.TestCase):
         We verify this at the prompt level (rather than runtime) so the
         contract is locked even if the test environment lacks LLM
         credentials."""
-        if main_copy is None:
-            self.skipTest(f"main_copy unavailable in this environment: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine unavailable in this environment: {MAIN_COPY_IMPORT_ERROR}")
         import inspect
 
-        source = inspect.getsource(main_copy._build_major_lookup_draft)
+        source = inspect.getsource(advisor_engine._build_major_lookup_draft)
         # The system prompt must prefer (b) over (c) and reserve (c) for
         # cases where the bucket is *genuinely* unidentifiable.
         self.assertIn("you MUST use this form", source)
@@ -1770,11 +1770,11 @@ class InlinePrereqContractTests(unittest.TestCase):
         """The synthesis prompt must contain the inline-prereq rule so
         the LLM emits the annotation on first attempt rather than only
         on retry. Locks the prompt-level contract."""
-        if main_copy is None:
-            self.skipTest(f"main_copy unavailable in this environment: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine unavailable in this environment: {MAIN_COPY_IMPORT_ERROR}")
         import inspect
 
-        source = inspect.getsource(main_copy._build_major_lookup_draft)
+        source = inspect.getsource(advisor_engine._build_major_lookup_draft)
         self.assertIn("INLINE PREREQUISITE ANNOTATION RULE", source)
         self.assertIn("(prerequisites:", source)
         # Retry directive must exist for this failure mode.
@@ -2106,8 +2106,8 @@ class WebFallbackAcceptanceTests(unittest.TestCase):
         """Trace 2's exact failure: web fallback returned bullet-list prose
         with no Semester block and no course code, and the system shipped it.
         The acceptance check must reject that."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         vague = (
             "- Semester 1 - Intro Art course\n"
             "- Semester 2 - More art classes\n"
@@ -2115,14 +2115,14 @@ class WebFallbackAcceptanceTests(unittest.TestCase):
         )
         plan = self._make_plan("multi_semester", "multi_semester_plan")
         self.assertFalse(
-            main_copy._web_fallback_is_structurally_acceptable(vague, plan),
+            advisor_engine._web_fallback_is_structurally_acceptable(vague, plan),
             "Vague prose with no semester block and no course code must be rejected",
         )
 
     def test_acceptance_check_accepts_real_plan_with_block_and_codes(self):
         """A real semester block with course codes is accepted."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         good = (
             "Semester 1:\n"
             "- ART 010: Drawing I (prerequisites: None) — 3 credits\n"
@@ -2131,22 +2131,22 @@ class WebFallbackAcceptanceTests(unittest.TestCase):
         )
         plan = self._make_plan("multi_semester", "multi_semester_plan")
         self.assertTrue(
-            main_copy._web_fallback_is_structurally_acceptable(good, plan),
+            advisor_engine._web_fallback_is_structurally_acceptable(good, plan),
         )
 
     def test_acceptance_check_accepts_anything_for_lookup_deliverables(self):
         """Lookup-style deliverables (direct_answer / major_lookup) accept
         any non-empty web response — a registrar paragraph is a valid
         answer to 'tell me about the Art major'."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         prose = "The Art major at Penn State Abington offers concentrations in painting, sculpture, and digital media."
         plan = self._make_plan("direct_answer", "major_lookup")
         self.assertTrue(
-            main_copy._web_fallback_is_structurally_acceptable(prose, plan),
+            advisor_engine._web_fallback_is_structurally_acceptable(prose, plan),
         )
         self.assertTrue(
-            main_copy._web_fallback_is_structurally_acceptable(prose, None),
+            advisor_engine._web_fallback_is_structurally_acceptable(prose, None),
             "No plan at all is treated as a non-recommendation deliverable",
         )
 
@@ -2154,8 +2154,8 @@ class WebFallbackAcceptanceTests(unittest.TestCase):
         """End-to-end: when retrieval returns nothing AND the web fallback
         returns vague prose, ``_build_major_lookup_draft`` must return the
         honest soft-ask, not the vague prose."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         from orchestration_pipeline import OrchestrationPlan
 
         plan = OrchestrationPlan(
@@ -2184,23 +2184,23 @@ class WebFallbackAcceptanceTests(unittest.TestCase):
             "citations": [],
         }
 
-        with patch.dict(main_copy.EXECUTOR_TOOLS, empty_registry, clear=True), \
+        with patch.dict(advisor_engine.EXECUTOR_TOOLS, empty_registry, clear=True), \
              patch.object(
-                 main_copy,
+                 advisor_engine,
                  "_run_shared_search_pipeline",
                  lambda **kw: fake_search_result,
              ), \
              patch.object(
-                 main_copy,
+                 advisor_engine,
                  "_research_answer_text",
                  lambda r: r.get("answer", ""),
              ), \
              patch.object(
-                 main_copy,
+                 advisor_engine,
                  "_resolved_search_to_metadata",
                  lambda r: {},
              ):
-            response, tools_used, metadata = main_copy._build_major_lookup_draft(
+            response, tools_used, metadata = advisor_engine._build_major_lookup_draft(
                 user_question="art and accounting double major plan",
                 trace=None,
                 allowed_tools={
@@ -2221,8 +2221,8 @@ class WebFallbackAcceptanceTests(unittest.TestCase):
     def test_build_major_lookup_draft_passes_through_real_plan_from_web_search(self):
         """Sanity check: when the web fallback DOES return a structurally
         acceptable plan (semester block + course code), it must be shipped."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         from orchestration_pipeline import OrchestrationPlan
 
         plan = OrchestrationPlan(
@@ -2248,13 +2248,13 @@ class WebFallbackAcceptanceTests(unittest.TestCase):
             "- ART 010: Drawing I (prerequisites: None)\n"
             "Total Credits: 3"
         )
-        with patch.dict(main_copy.EXECUTOR_TOOLS, empty_registry, clear=True), \
-             patch.object(main_copy, "_run_shared_search_pipeline",
+        with patch.dict(advisor_engine.EXECUTOR_TOOLS, empty_registry, clear=True), \
+             patch.object(advisor_engine, "_run_shared_search_pipeline",
                           lambda **kw: {"answer": good_plan_text}), \
-             patch.object(main_copy, "_research_answer_text",
+             patch.object(advisor_engine, "_research_answer_text",
                           lambda r: r.get("answer", "")), \
-             patch.object(main_copy, "_resolved_search_to_metadata", lambda r: {}):
-            response, tools_used, metadata = main_copy._build_major_lookup_draft(
+             patch.object(advisor_engine, "_resolved_search_to_metadata", lambda r: {}):
+            response, tools_used, metadata = advisor_engine._build_major_lookup_draft(
                 user_question="art plan",
                 trace=None,
                 allowed_tools={"majors_retriever", "course_retriever",
@@ -2347,7 +2347,7 @@ class MultiMajorContractTests(unittest.TestCase):
         self.assertEqual([s["tool"] for s in steps],
                          ["majors_retriever", "course_retriever", "prerequisite_graph"])
 
-    @unittest.skipIf(main_copy is None, f"main_copy unavailable: {MAIN_COPY_IMPORT_ERROR}")
+    @unittest.skipIf(advisor_engine is None, f"advisor_engine unavailable: {MAIN_COPY_IMPORT_ERROR}")
     def test_executor_keeps_multi_major_plan_on_llm_retrieval_path(self):
         """The LLM orchestrator's multi-major route must not be overwritten by
         the single-major deterministic planner shortcut.
@@ -2374,13 +2374,13 @@ class MultiMajorContractTests(unittest.TestCase):
             majors=["Biology", "Computer Science"],
         )
 
-        with patch.object(main_copy, "generate_plan_from_major_and_year") as deterministic_planner, \
+        with patch.object(advisor_engine, "generate_plan_from_major_and_year") as deterministic_planner, \
              patch.object(
-                 main_copy,
+                 advisor_engine,
                  "_build_major_lookup_draft",
                  return_value=("multi-major grounded draft", ["majors_retriever"], {"source": "major_lookup_rag"}),
              ) as major_lookup:
-            response, tools_used, metadata = main_copy._build_executor_draft(
+            response, tools_used, metadata = advisor_engine._build_executor_draft(
                 user_id="test",
                 plan=plan,
                 user_question=plan.corrected_question,
@@ -2515,13 +2515,13 @@ class PrereqBackfillTests(unittest.TestCase):
         )
 
     def test_collect_codes_from_text_dedupes_and_orders(self):
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         text = (
             "Prescribed Courses: ART 11, ART 110, ART 111, ART 122Y, ARTH 111. "
             "Required: ACCTG 211, ECON 102, ECON 102, MGMT 301."
         )
-        codes = main_copy._collect_codes_from_text(text)
+        codes = advisor_engine._collect_codes_from_text(text)
         # Order preserved, duplicates dropped.
         self.assertEqual(
             codes,
@@ -2530,14 +2530,14 @@ class PrereqBackfillTests(unittest.TestCase):
         )
 
     def test_collect_codes_already_attempted_reads_both_shapes(self):
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         text = (
             "Prerequisites for ART 110:\n- Enforced prerequisite at enrollment: None\n\n"
             "No course named 'ART 122' found.\n\n"
             "Prerequisites for ACCTG 211:\n- Enforced prerequisite at enrollment: MATH 21"
         )
-        attempted = main_copy._collect_codes_already_attempted(text)
+        attempted = advisor_engine._collect_codes_already_attempted(text)
         self.assertEqual(attempted, {"ART 110", "ART 122", "ACCTG 211"})
 
     def test_backfill_issues_followup_for_codes_not_covered_by_planner(self):
@@ -2547,15 +2547,15 @@ class PrereqBackfillTests(unittest.TestCase):
         MGMT 301) and merge the result into the bundle. Without this, the
         synthesizer writes ``(prerequisites: not retrieved)`` for ECON 102
         and MGMT 301 — which is the exact bug from the user's trace."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
 
         prereq_calls: List[str] = []
 
         def fake_prereq(query, ctx):
             prereq_calls.append(query)
             # Return one entry per code in the query.
-            codes = main_copy._collect_codes_from_text(query)
+            codes = advisor_engine._collect_codes_from_text(query)
             parts = [
                 f"Prerequisites for {code}:\n- Enforced prerequisite at enrollment: None\n"
                 f"- Enforced concurrent at enrollment: None"
@@ -2574,8 +2574,8 @@ class PrereqBackfillTests(unittest.TestCase):
         }
 
         plan = self._plan()
-        with patch.dict(main_copy.EXECUTOR_TOOLS, fake_registry, clear=True):
-            bundle, tools_used = main_copy._execute_retrieval_plan(plan)
+        with patch.dict(advisor_engine.EXECUTOR_TOOLS, fake_registry, clear=True):
+            bundle, tools_used = advisor_engine._execute_retrieval_plan(plan)
 
         self.assertIn("prerequisite_graph", bundle)
         prereq_text = bundle["prerequisite_graph"]["results"]
@@ -2589,12 +2589,12 @@ class PrereqBackfillTests(unittest.TestCase):
         # only the missing codes.
         self.assertEqual(len(prereq_calls), 2)
         self.assertEqual(
-            main_copy._collect_codes_from_text(prereq_calls[0]),
+            advisor_engine._collect_codes_from_text(prereq_calls[0]),
             ["ART 110", "ART 111", "ACCTG 211"],
         )
         # Backfill should target only the codes the planner missed.
         self.assertEqual(
-            set(main_copy._collect_codes_from_text(prereq_calls[1])),
+            set(advisor_engine._collect_codes_from_text(prereq_calls[1])),
             {"ECON 102", "MGMT 301"},
         )
         self.assertIn("prerequisite_graph", tools_used)
@@ -2604,14 +2604,14 @@ class PrereqBackfillTests(unittest.TestCase):
         named X found.', that code counts as ATTEMPTED — re-querying would
         just repeat the same negative answer. Only truly un-queried codes
         should be in the follow-up call."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
 
         prereq_calls: List[str] = []
 
         def fake_prereq(query, ctx):
             prereq_calls.append(query)
-            codes = main_copy._collect_codes_from_text(query)
+            codes = advisor_engine._collect_codes_from_text(query)
             parts = []
             for code in codes:
                 if code == "ART 11":
@@ -2647,11 +2647,11 @@ class PrereqBackfillTests(unittest.TestCase):
                 {"tool": "prerequisite_graph", "query": "ART 11, ART 110", "reason": "r2"},
             ],
         )
-        with patch.dict(main_copy.EXECUTOR_TOOLS, fake_registry, clear=True):
-            main_copy._execute_retrieval_plan(plan)
+        with patch.dict(advisor_engine.EXECUTOR_TOOLS, fake_registry, clear=True):
+            advisor_engine._execute_retrieval_plan(plan)
 
         self.assertEqual(len(prereq_calls), 2)
-        backfill_codes = set(main_copy._collect_codes_from_text(prereq_calls[1]))
+        backfill_codes = set(advisor_engine._collect_codes_from_text(prereq_calls[1]))
         self.assertEqual(
             backfill_codes,
             {"ECON 102"},
@@ -2662,8 +2662,8 @@ class PrereqBackfillTests(unittest.TestCase):
         """The bundle self-consistency rule only matters for course
         recommendation deliverables. A simple ``major_lookup`` describing
         what a major IS does not need every mentioned code prereq-checked."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
 
         prereq_calls: List[str] = []
 
@@ -2685,11 +2685,11 @@ class PrereqBackfillTests(unittest.TestCase):
             ],
         )
         majors_text = "Prescribed: ART 11, ART 110, ART 122Y, ECON 102."
-        with patch.dict(main_copy.EXECUTOR_TOOLS, {
+        with patch.dict(advisor_engine.EXECUTOR_TOOLS, {
             "majors_retriever":   lambda q, ctx: majors_text,
             "prerequisite_graph": fake_prereq,
         }, clear=True):
-            main_copy._execute_retrieval_plan(plan)
+            advisor_engine._execute_retrieval_plan(plan)
 
         # Only the planner's single prereq step ran; backfill did not fire.
         self.assertEqual(len(prereq_calls), 1)
@@ -2699,14 +2699,14 @@ class PrereqBackfillTests(unittest.TestCase):
         """If the planner didn't include a prereq step at all but the
         deliverable is a course recommendation, backfill must still run and
         seed the prereq section so the synthesizer has something to cite."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
 
         prereq_calls: List[str] = []
 
         def fake_prereq(query, ctx):
             prereq_calls.append(query)
-            codes = main_copy._collect_codes_from_text(query)
+            codes = advisor_engine._collect_codes_from_text(query)
             return "\n\n".join(
                 f"Prerequisites for {c}:\n- Enforced prerequisite at enrollment: None"
                 for c in codes
@@ -2725,11 +2725,11 @@ class PrereqBackfillTests(unittest.TestCase):
             ],
         )
         majors_text = "Prescribed: ART 110, ART 111."
-        with patch.dict(main_copy.EXECUTOR_TOOLS, {
+        with patch.dict(advisor_engine.EXECUTOR_TOOLS, {
             "majors_retriever":   lambda q, ctx: majors_text,
             "prerequisite_graph": fake_prereq,
         }, clear=True):
-            bundle, tools_used = main_copy._execute_retrieval_plan(plan)
+            bundle, tools_used = advisor_engine._execute_retrieval_plan(plan)
 
         self.assertIn("prerequisite_graph", bundle,
                       "Backfill must seed prereq section when planner skipped it")
@@ -2770,10 +2770,10 @@ class InlinePrereqRewriteTests(unittest.TestCase):
         """LLM wrote '(prerequisites: None)' for MATH 140 — graph says it
         actually has a real prereq. Rewrite must replace 'None' with the
         verified prereq text."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         response = "- MATH 140: Calculus I (prerequisites: None)"
-        rewritten = main_copy._rewrite_inline_prereqs_from_graph(
+        rewritten = advisor_engine._rewrite_inline_prereqs_from_graph(
             response, self.GRAPH_TEXT
         )
         self.assertNotIn("(prerequisites: None)", rewritten)
@@ -2783,10 +2783,10 @@ class InlinePrereqRewriteTests(unittest.TestCase):
         """LLM wrote '(prerequisites: ARTH 250)' for PHOTO 201 — graph
         only lists ARTH 250 as concurrent (not enforced). Rewrite must
         downgrade to 'None'."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         response = "- PHOTO 201: Studio Photography (prerequisites: ARTH 250)"
-        rewritten = main_copy._rewrite_inline_prereqs_from_graph(
+        rewritten = advisor_engine._rewrite_inline_prereqs_from_graph(
             response, self.GRAPH_TEXT
         )
         self.assertIn("(prerequisites: None)", rewritten)
@@ -2795,25 +2795,25 @@ class InlinePrereqRewriteTests(unittest.TestCase):
     def test_preserves_correct_annotations(self):
         """ART 280 already has the right prereq written verbatim. Rewrite
         must be idempotent (don't garble correct entries)."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         response = "- ART 280: Drawing II (prerequisites: ART 110 or ART 111)"
-        rewritten = main_copy._rewrite_inline_prereqs_from_graph(
+        rewritten = advisor_engine._rewrite_inline_prereqs_from_graph(
             response, self.GRAPH_TEXT
         )
         self.assertIn("(prerequisites: ART 110 or ART 111)", rewritten)
 
     def test_leaves_lines_without_inline_annotation_alone(self):
         """Headers, plain prose, and section dividers must not be touched."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         response = (
             "### Year 1\n"
             "**Semester 1:**\n"
             "Hi — here is your plan.\n"
             "**Total Credits: 15**"
         )
-        rewritten = main_copy._rewrite_inline_prereqs_from_graph(
+        rewritten = advisor_engine._rewrite_inline_prereqs_from_graph(
             response, self.GRAPH_TEXT
         )
         self.assertEqual(rewritten, response)
@@ -2821,10 +2821,10 @@ class InlinePrereqRewriteTests(unittest.TestCase):
     def test_leaves_lines_for_unknown_courses_alone(self):
         """If the line's course is not in the graph at all, the LLM's
         annotation stays — we don't have ground truth to overwrite with."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         response = "- ZZZZ 999: Mystery Course (prerequisites: not retrieved)"
-        rewritten = main_copy._rewrite_inline_prereqs_from_graph(
+        rewritten = advisor_engine._rewrite_inline_prereqs_from_graph(
             response, self.GRAPH_TEXT
         )
         self.assertEqual(rewritten, response)
@@ -2834,22 +2834,22 @@ class InlinePrereqRewriteTests(unittest.TestCase):
         contain multiple codes. The first code that's in the graph is the
         recommendation target. ART 110 is in the graph (None prereqs), so
         the rewrite normalizes the annotation to '(prerequisites: None)'."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         response = (
             "- GH Humanities elective — examples: ART 110, ART 111 "
             "(prerequisites: None)"
         )
-        rewritten = main_copy._rewrite_inline_prereqs_from_graph(
+        rewritten = advisor_engine._rewrite_inline_prereqs_from_graph(
             response, self.GRAPH_TEXT
         )
         self.assertIn("(prerequisites: None)", rewritten)
 
     def test_empty_graph_text_passes_through(self):
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         response = "- MATH 140: Calculus I (prerequisites: None)"
-        rewritten = main_copy._rewrite_inline_prereqs_from_graph(response, "")
+        rewritten = advisor_engine._rewrite_inline_prereqs_from_graph(response, "")
         self.assertEqual(rewritten, response)
 
 
@@ -2913,10 +2913,10 @@ class FinalizerUniversalPrereqTests(unittest.TestCase):
             metadata={"prereq_graph_text": prereq_graph_text},
         )
 
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         helpers = {
-            "rewrite_inline_prereqs": main_copy._rewrite_inline_prereqs_from_graph,
+            "rewrite_inline_prereqs": advisor_engine._rewrite_inline_prereqs_from_graph,
         }
 
         final_response, meta = run_finalizer_stage(
@@ -2998,10 +2998,10 @@ class FinalizerUniversalPrereqTests(unittest.TestCase):
             tools_used=["policy_retriever"],
             metadata={},  # no prereq_graph_text
         )
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         helpers = {
-            "rewrite_inline_prereqs": main_copy._rewrite_inline_prereqs_from_graph,
+            "rewrite_inline_prereqs": advisor_engine._rewrite_inline_prereqs_from_graph,
         }
         final_response, _ = run_finalizer_stage(
             plan=plan,
@@ -3027,26 +3027,26 @@ class NoAnswerFoundGatekeeperTests(unittest.TestCase):
     """
 
     def test_short_giveup_response_still_caught(self):
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         self.assertTrue(
-            main_copy._response_indicates_no_answer_found(
+            advisor_engine._response_indicates_no_answer_found(
                 "I don't have any information on that."
             )
         )
 
     def test_empty_response_caught(self):
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
-        self.assertTrue(main_copy._response_indicates_no_answer_found(""))
-        self.assertTrue(main_copy._response_indicates_no_answer_found("   "))
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
+        self.assertTrue(advisor_engine._response_indicates_no_answer_found(""))
+        self.assertTrue(advisor_engine._response_indicates_no_answer_found("   "))
 
     def test_response_with_semester_block_kept_even_with_phrase(self):
         """The exact production failure: a real plan with a semester block
         that mentions 'I don't have' for one missing piece. Must NOT be
         treated as a give-up."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         response = (
             "Here is a draft 8-semester plan for a double major in Art "
             "and Economics.\n\n"
@@ -3057,43 +3057,43 @@ class NoAnswerFoundGatekeeperTests(unittest.TestCase):
             "Note: I don't have the option-track data for the Art BFA, "
             "so confirm with your advisor."
         )
-        self.assertFalse(main_copy._response_indicates_no_answer_found(response))
+        self.assertFalse(advisor_engine._response_indicates_no_answer_found(response))
 
     def test_response_with_multiple_course_codes_kept(self):
         """Two or more PSU course codes signals a real, content-bearing
         response — keep it even if the phrase appears."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         response = (
             "Suggested first-year courses: ENGL 15, MATH 140, ECON 102, "
             "ART 110. I don't have the official advising notes for this "
             "specific combination."
         )
-        self.assertFalse(main_copy._response_indicates_no_answer_found(response))
+        self.assertFalse(advisor_engine._response_indicates_no_answer_found(response))
 
     def test_long_response_kept_even_with_phrase(self):
         """A long response (>800 chars) is clearly not a one-line giveup
         regardless of which phrase it contains."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         response = (
             "Here's a detailed walkthrough of the double-major path. "
             * 30
             + " I don't have the option-track names handy."
         )
         self.assertGreater(len(response), 800)
-        self.assertFalse(main_copy._response_indicates_no_answer_found(response))
+        self.assertFalse(advisor_engine._response_indicates_no_answer_found(response))
 
     def test_short_response_with_phrase_and_no_codes_caught(self):
         """A short response that's just a 'no answer' message — still
         treated as a giveup."""
-        if main_copy is None:
-            self.skipTest(f"main_copy not importable: {MAIN_COPY_IMPORT_ERROR}")
+        if advisor_engine is None:
+            self.skipTest(f"advisor_engine not importable: {MAIN_COPY_IMPORT_ERROR}")
         response = (
             "Sorry — I couldn't find anything matching that question in "
             "our records."
         )
-        self.assertTrue(main_copy._response_indicates_no_answer_found(response))
+        self.assertTrue(advisor_engine._response_indicates_no_answer_found(response))
 
 
 class GraphBuilderTwoDigitPrereqTests(unittest.TestCase):
