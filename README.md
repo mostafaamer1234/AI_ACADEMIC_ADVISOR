@@ -9,7 +9,7 @@
 
 The project is built around a practical AI engineering pattern: use LLMs for reasoning, planning, and synthesis, while keeping critical academic logic deterministic, observable, and tool-driven.
 
-**Project page: [ai-advisor-mostafa.vercel.app](https://ai-advisor-mostafa.vercel.app)**. The three-agent workflow, plus the independent plan referee running in your browser against the 9,248-course catalog. The page lives in `site/` and its data comes from `python -m evals.export_site_catalog`.
+**Try it: [ai-advisor-mostafa.vercel.app](https://ai-advisor-mostafa.vercel.app)**. Open the link and chat with Leo right away: semester plans that respect prerequisites (checked by the independent referee), course and prerequisite lookups across the 9,248-course catalog, major requirements and answers from the advising FAQ. This public version needs no account or API key. It runs the advisor's deterministic tools in your browser, without the LLM agents or transcript upload of the full app below. [About the project](https://ai-advisor-mostafa.vercel.app/about). The site lives in `site/`. Its data comes from `python -m evals.export_site_chat` (needs `wordninja` and `pypdf`) and `python -m evals.export_site_catalog`.
 
 
 Hosted on AWS : https://3.145.213.72/ 
